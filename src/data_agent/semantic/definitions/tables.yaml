@@ -1,0 +1,156 @@
+# 语义层 · 表定义
+#
+# 这份文件的目的不是描述"表里有什么字段"（DDL 已经做了），而是告诉模型
+# "这些字段在业务上意味着什么、什么时候不能用、有什么坑"。
+
+- name: orders
+  description: 订单主表，一行一个订单
+  grain: 一行一个订单
+  notes:
+    - 统计成交类指标必须按 pay_time 归期，不要用 create_time
+    - "已支付订单的 status 是 paid 或 refunded；refunded 表示已支付后又退款"
+    - amount 是折扣后的应付金额，不要用明细表金额求和代替
+  columns:
+    - name: order_id
+      type: VARCHAR
+      description: 订单唯一标识
+    - name: user_id
+      type: VARCHAR
+      description: 下单用户，关联 users.user_id
+    - name: create_time
+      type: TIMESTAMP
+      description: 订单创建时间
+      notes: 这是"下单"时间，不是"成交"时间。用来算转化率可以，用来算成交额不行
+    - name: pay_time
+      type: TIMESTAMP
+      description: 支付时间
+      notes: 未支付订单为 NULL。约 3.5% 的订单会跨月支付（下单在月末、支付在次月初），因此按 create_time 和按 pay_time 归期得到的结果不同
+    - name: status
+      type: VARCHAR
+      description: 订单状态
+      values:
+        paid: 已支付
+        refunded: 已支付并已退款
+        pending: 待支付
+        cancelled: 已取消
+      notes: pending 和 cancelled 的 pay_time 一定是 NULL
+    - name: amount
+      type: DECIMAL(12,2)
+      description: 订单应付金额（已扣除折扣）
+      notes: 这是成交额的正确口径。order_items 中的 unit_price*quantity 是折扣前金额，直接求和会偏高
+    - name: channel
+      type: VARCHAR
+      description: 获客渠道，冗余自用户表
+
+- name: users
+  description: 用户表，一行一个注册用户
+  grain: 一行一个用户
+  notes:
+    - city 有约 2% 为空值，按城市分组时会出现 NULL 组
+  columns:
+    - name: user_id
+      type: VARCHAR
+      description: 用户唯一标识
+    - name: register_time
+      type: TIMESTAMP
+      description: 注册时间
+    - name: city
+      type: VARCHAR
+      description: 用户所在城市
+      notes: 可能为 NULL，分组统计时建议显式处理
+    - name: channel
+      type: VARCHAR
+      description: "获客渠道：organic / ads / referral / social"
+    - name: is_vip
+      type: BOOLEAN
+      description: 是否付费会员
+
+- name: products
+  description: 商品表，一行一个 SKU
+  grain: 一行一个商品
+  columns:
+    - name: product_id
+      type: VARCHAR
+      description: 商品唯一标识
+    - name: product_name
+      type: VARCHAR
+      description: 商品名称
+    - name: category
+      type: VARCHAR
+      description: "商品类目：数码 / 家电 / 服饰 / 美妆 / 食品 / 家居"
+    - name: list_price
+      type: DECIMAL(10,2)
+      description: 商品标价（折扣前）
+
+- name: order_items
+  description: 订单明细表，一行一个商品行
+  grain: 一行一个订单中的一个商品
+  notes:
+    - unit_price*quantity 是折扣前金额
+    - 统计成交额请用 orders.amount，不要用这里的金额求和
+  columns:
+    - name: order_item_id
+      type: VARCHAR
+      description: 明细唯一标识
+    - name: order_id
+      type: VARCHAR
+      description: 关联 orders.order_id
+    - name: product_id
+      type: VARCHAR
+      description: 关联 products.product_id
+    - name: quantity
+      type: INTEGER
+      description: 购买数量
+    - name: unit_price
+      type: DECIMAL(10,2)
+      description: 成交单价（折扣前）
+    - name: discount
+      type: DECIMAL(10,2)
+      description: 该行的折扣金额
+
+- name: refunds
+  description: 退款表，一行一次退款
+  grain: 一行一次退款
+  notes:
+    - 只有 status='refunded' 的订单才会有退款记录
+    - 退款可能是部分退款，refund_amount 不一定等于订单金额
+    - 统计净成交额时需要扣减退款，统计 GMV 时不用
+  columns:
+    - name: refund_id
+      type: VARCHAR
+      description: 退款唯一标识
+    - name: order_id
+      type: VARCHAR
+      description: 关联 orders.order_id
+    - name: refund_time
+      type: TIMESTAMP
+      description: 退款发生时间
+      notes: 退款时间与订单支付时间通常不在同一个月，按哪个时间归期会影响"净成交额"的口径
+    - name: refund_amount
+      type: DECIMAL(12,2)
+      description: 退款金额
+    - name: reason
+      type: VARCHAR
+      description: 退款原因
+
+- name: page_events
+  description: 用户页面行为日志
+  grain: 一行一次页面访问事件
+  notes:
+    - 这是埋点日志，与订单没有直接外键关系，只能通过 user_id 关联
+  columns:
+    - name: event_id
+      type: VARCHAR
+      description: 事件唯一标识
+    - name: user_id
+      type: VARCHAR
+      description: 关联 users.user_id
+    - name: event_time
+      type: TIMESTAMP
+      description: 事件发生时间
+    - name: page
+      type: VARCHAR
+      description: "页面标识：home / search / detail / cart / pay"
+    - name: device
+      type: VARCHAR
+      description: "设备类型：ios / android / web"

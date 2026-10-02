@@ -1,0 +1,51 @@
+# 语义层 · 业务规则
+#
+# 这些是"不允许出错"的硬规则。生成 SQL 前注入给模型，执行后用于校验。
+
+- id: R001
+  scope: global
+  severity: error
+  description: 成交类指标（GMV、净成交额、客单价、支付订单数）必须按 orders.pay_time 归期，禁止使用 create_time
+  rationale: 下单时间和支付时间可能跨月，用错会产生口径不一致
+
+- id: R002
+  scope: gmv
+  severity: error
+  description: 成交额必须取 orders.amount（已扣折扣），禁止用 order_items 的 unit_price*quantity 求和
+  rationale: 明细表是折扣前金额，直接求和会系统性偏高
+
+- id: R003
+  scope: global
+  severity: error
+  description: 涉及成交的统计必须过滤 pay_time IS NOT NULL，未支付订单不产生成交
+  rationale: pending 和 cancelled 订单的金额不应计入成交
+
+- id: R004
+  scope: net_gmv
+  severity: warning
+  description: 净成交额有两种口径（退款按订单支付时间归期 / 按退款发生时间归期），使用前必须与需求方确认
+  rationale: 两种口径结果不同，混用会导致报表对不上
+
+- id: R005
+  scope: global
+  severity: warning
+  description: users.city 可能为空，按城市分组时应说明是丢弃还是归入"未知"
+  rationale: 直接 GROUP BY 会出现 NULL 分组，容易被误读为数据错误
+
+- id: R006
+  scope: global
+  severity: error
+  description: 只允许只读查询，禁止任何写操作（INSERT/UPDATE/DELETE/DROP/TRUNCATE/CREATE）以及 SELECT ... INTO
+  rationale: 分析场景不应修改数据
+
+- id: R007
+  scope: refund_rate
+  severity: warning
+  description: 退款率的分子分母归期字段不同，做时间对比时需要说明口径
+  rationale: 退款可能发生在支付后的下一个月甚至更晚
+
+- id: R008
+  scope: global
+  severity: info
+  description: 金额单位统一为元，比率类指标返回 0-1 的小数并保留四位，必要时再换算成百分比
+  rationale: 避免同一份报表里小数和百分数混用

@@ -1,0 +1,277 @@
+"""按意图检索语义层，组装成精简的上下文。
+
+为什么不做全量注入：把 6 张表 + 10 个指标 + 8 条规则全塞进 prompt，
+既浪费 token 又会引入无关干扰——实测里这会让模型更容易选错字段。
+
+评分设计（踩过两次坑之后定下来的）：
+
+  1. **别名命中是最强信号，且长别名优先。**
+     "净成交额" 包含 "成交额"，所以问净成交额时两个指标都会被命中，
+     必须让长别名胜出，并剔除被更长别名包含的短别名。
+
+  2. **文本相似度用重叠 token 数，不做长度归一化。**
+     一开始按 `overlap / sqrt(描述长度)` 归一化，结果是描述越短的指标
+     得分越高——net_gmv 的描述比 gmv 短，于是问"成交额"时 net_gmv 反而排第一。
+     归一化的方向错了：该惩罚的是"描述长所以碰巧命中多"，而不是"命中多"。
+
+  3. **必选表不能被裁掉。** 选中 net_gmv 就必须带上它 join 的 refunds，
+     否则模型写不出正确的关联。
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+
+from data_agent.semantic.models import Metric, Rule, SemanticLayer, Table
+
+_ASCII_WORD = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]*")
+_CJK = re.compile(r"[\u4e00-\u9fff]+")
+
+# 别名命中的基础分：保证"命中别名"永远压过"只是描述里有几个词重合"
+_ALIAS_BASE = 1.0
+# 别名每多一个字加的分，用于让长别名胜出
+_ALIAS_LEN_BONUS = 0.1
+# 描述里每多一个重合 token 加的分
+_TEXT_BONUS = 0.15
+# 只靠描述重合进入候选的门槛（至少两个词重合才算相关）
+_MIN_DESCRIPTION_OVERLAP = 2
+
+# 可选表的相关性权重。表名/表注释是强信号，字段是中等信号，
+# 补充说明(notes)是弱信号——notes 里常常只是"顺带提到"别的表。
+_TABLE_W_NAME = 0.5
+_TABLE_W_COLUMN = 0.3
+_TABLE_W_NOTES = 0.1
+_TABLE_MIN_SCORE = 0.25
+
+
+def _tokens(text: str) -> set[str]:
+    """把中英文混合文本切成可比较的 token。
+
+    中文按字符二元组切分（"上月成交额" -> 上月/月成/成交/交额）；
+    英文标识符按单词切分，并额外拆出下划线子词
+    （"is_vip" -> is_vip / is / vip），这样问 "VIP" 也能命中列名。
+    """
+    text = text.lower()
+    out: set[str] = set()
+    for word in _ASCII_WORD.findall(text):
+        out.add(word)
+        if "_" in word:
+            out.update(part for part in word.split("_") if part)
+    for run in _CJK.findall(text):
+        if len(run) == 1:
+            out.add(run)
+        for i in range(len(run) - 1):
+            out.add(run[i : i + 2])
+    return out
+
+
+def _overlap_count(query_tokens: set[str], *texts: str) -> int:
+    merged: set[str] = set()
+    for t in texts:
+        if t:
+            merged |= _tokens(t)
+    return len(query_tokens & merged)
+
+
+def _join_tables(metric: Metric, layer: SemanticLayer) -> list[str]:
+    """从指标的 join 语句里解析出它依赖哪些表。"""
+    known = {t.name for t in layer.tables}
+    found: list[str] = []
+    for join in metric.joins:
+        for ident in _ASCII_WORD.findall(join.lower()):
+            if ident in known and ident not in found:
+                found.append(ident)
+    return found
+
+
+def _table_relevance(qt: set[str], table: Table) -> float:
+    """可选表的相关性打分。"""
+    s = _TABLE_W_NAME * _overlap_count(qt, table.name, table.description)
+    s += _TABLE_W_COLUMN * _overlap_count(
+        qt,
+        " ".join(c.name for c in table.columns),
+        " ".join(c.description for c in table.columns),
+    )
+    s += _TABLE_W_NOTES * _overlap_count(qt, " ".join(table.notes))
+    return s
+
+
+@dataclass
+class MetricHit:
+    metric: Metric
+    score: float
+    matched_alias: str | None
+
+
+@dataclass
+class Selection:
+    """一次检索的结果，保留命中原因便于调试和评测。"""
+
+    tables: list[Table] = field(default_factory=list)
+    metrics: list[Metric] = field(default_factory=list)
+    rules: list[Rule] = field(default_factory=list)
+    scores: dict[str, float] = field(default_factory=dict)
+
+    def table_names(self) -> list[str]:
+        return [t.name for t in self.tables]
+
+    def metric_names(self) -> list[str]:
+        return [m.name for m in self.metrics]
+
+
+def _score_metrics(layer: SemanticLayer, question: str, qt: set[str]) -> list[MetricHit]:
+    q_lower = question.lower()
+    hits: list[MetricHit] = []
+
+    for m in layer.metrics:
+        # 别名 / 指标名 / 显示名，取命中的最长者
+        candidates = [*m.aliases, m.name, m.display_name]
+        matched: str | None = None
+        for c in candidates:
+            if c and c.lower() in q_lower and (matched is None or len(c) > len(matched)):
+                matched = c
+
+        overlap = _overlap_count(qt, m.description, " ".join(m.aliases), m.display_name)
+        if matched is None and overlap < _MIN_DESCRIPTION_OVERLAP:
+            continue
+
+        score = 0.0
+        if matched is not None:
+            score += _ALIAS_BASE + _ALIAS_LEN_BONUS * len(matched)
+        score += _TEXT_BONUS * overlap
+        hits.append(MetricHit(metric=m, score=score, matched_alias=matched))
+
+    # 长别名优先：剔除那些"命中别名被另一个更长命中别名包含"的指标
+    # 例："净成交额" 命中时，靠 "成交额" 命中的 gmv 应该让位
+    dropped: set[str] = set()
+    for a in hits:
+        if not a.matched_alias:
+            continue
+        for b in hits:
+            if a is b or not b.matched_alias:
+                continue
+            if a.matched_alias.lower() != b.matched_alias.lower() and \
+               a.matched_alias.lower() in b.matched_alias.lower():
+                dropped.add(a.metric.name)
+                break
+
+    return [h for h in hits if h.metric.name not in dropped]
+
+
+def _prune_relative(scored: list, *, min_ratio: float) -> list:
+    """只保留与最高分同量级的结果，避免"雨露均沾"式召回。"""
+    if not scored:
+        return []
+    top = scored[0][0]
+    if top <= 0:
+        return []
+    return [item for item in scored if item[0] >= top * min_ratio]
+
+
+def select(
+    layer: SemanticLayer,
+    question: str,
+    *,
+    max_tables: int = 4,
+    max_metrics: int = 3,
+    metric_ratio: float = 0.75,
+) -> Selection:
+    """根据自然语言问题挑出相关的表、指标和规则。"""
+    qt = _tokens(question)
+    selection = Selection()
+
+    # ---- 1) 指标 ----
+    hits = _score_metrics(layer, question, qt)
+    hits.sort(key=lambda h: -h.score)
+    hits = _prune_relative([(h.score, h) for h in hits], min_ratio=metric_ratio)
+    selection.metrics = [h.metric for _, h in hits[:max_metrics]]
+    selection.scores.update(
+        {f"metric:{h.metric.name}": h.score for _, h in hits}
+    )
+
+    # ---- 2) 表 ----
+    # 必选表：选中指标依赖的表（基础表 + join 用到的表），绝不能因为分数低被裁掉
+    required: list[str] = []
+    for m in selection.metrics:
+        for name in [m.base_table, *_join_tables(m, layer)]:
+            if name not in required:
+                required.append(name)
+
+    # 可选表：问题关键词额外命中的表
+    optional: list[tuple[float, str]] = []
+    for t in layer.tables:
+        if t.name in required:
+            continue
+        s = _table_relevance(qt, t)
+        if s >= _TABLE_MIN_SCORE:
+            optional.append((s, t.name))
+    optional.sort(key=lambda x: -x[0])
+    optional = _prune_relative(optional, min_ratio=0.5)
+
+    chosen = list(required)
+    for _, name in optional:
+        if len(chosen) >= max_tables:
+            break
+        if name not in chosen:
+            chosen.append(name)
+
+    selection.tables = [t for t in (layer.table(n) for n in chosen) if t]
+    selection.scores.update({f"table_required:{n}": 1.0 for n in required})
+    selection.scores.update({f"table_optional:{n}": s for s, n in optional})
+
+    # ---- 3) 规则：全局规则始终带上，再叠加命中指标的专属规则 ----
+    selection.rules = layer.rules_for(*selection.metric_names())
+    return selection
+
+
+def render_context(selection: Selection, *, include_rules: bool = True) -> str:
+    """把检索结果渲染成可直接放进 prompt 的文本。"""
+    parts: list[str] = []
+
+    if selection.tables:
+        parts.append("## 相关表结构\n")
+        for t in selection.tables:
+            header = f"### {t.name} — {t.description}"
+            if t.grain and t.grain not in t.description:
+                header += f"（{t.grain}）"
+            parts.append(header)
+            for c in t.columns:
+                line = f"- {c.name} {c.type}：{c.description}"
+                if c.notes:
+                    line += f"  ⚠ {c.notes}"
+                if c.values:
+                    vals = " / ".join(f"{k}={v}" for k, v in c.values.items())
+                    line += f"  取值：{vals}"
+                parts.append(line)
+            for n in t.notes:
+                parts.append(f"- 【注意】{n}")
+            parts.append("")
+
+    if selection.metrics:
+        parts.append("## 指标口径\n")
+        for m in selection.metrics:
+            parts.append(f"### {m.name}（{m.display_name}）：{m.description}")
+            parts.append(f"- 计算：{m.definition}")
+            parts.append(f"- 归期字段：{m.time_table_name()}.{m.time_column}")
+            if m.joins:
+                parts.append(f"- 需要的关联：{'; '.join(m.joins)}")
+            if m.filters:
+                parts.append(f"- 必须的过滤：{'; '.join(m.filters)}")
+            for cv in m.caveats:
+                parts.append(f"- 【易错】{cv}")
+            parts.append("")
+
+    if include_rules and selection.rules:
+        parts.append("## 必须遵守的规则\n")
+        for r in selection.rules:
+            parts.append(f"- [{r.id}][{r.severity}] {r.description}")
+        parts.append("")
+
+    return "\n".join(parts).strip()
+
+
+def build_context(layer: SemanticLayer, question: str, **kwargs) -> tuple[Selection, str]:
+    """便捷入口：检索 + 渲染。"""
+    selection = select(layer, question, **kwargs)
+    return selection, render_context(selection)

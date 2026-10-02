@@ -1,0 +1,140 @@
+# 语义层 · 指标定义
+#
+# 每个指标给出：业务口径、可执行的 SQL 片段、以及容易搞错的地方。
+# alias 用于按用户口语检索指标（用户不会说 "net_gmv"，他会说"净销售额"）。
+
+- name: gmv
+  display_name: 成交总额
+  description: 统计期内已支付订单的金额合计
+  definition: SUM(orders.amount)
+  base_table: orders
+  time_column: pay_time
+  filters:
+    - orders.status IN ('paid', 'refunded')
+    - orders.pay_time IS NOT NULL
+  aliases: [GMV, 成交额, 销售额, 营业额, 交易额, 总成交]
+  caveats:
+    - 含已退款订单的金额。要看扣除退款后的口径请用 net_gmv
+    - 必须按 pay_time 归期，不要用 create_time
+  owner: 数据团队
+
+- name: net_gmv
+  display_name: 净成交额
+  description: 成交总额扣除退款金额
+  definition: SUM(orders.amount) - COALESCE(SUM(refunds.refund_amount), 0)
+  base_table: orders
+  joins:
+    - LEFT JOIN refunds ON refunds.order_id = orders.order_id
+  time_column: pay_time
+  filters:
+    - orders.status IN ('paid', 'refunded')
+    - orders.pay_time IS NOT NULL
+  aliases: [净成交额, 净销售额, 扣除退款, 净额, 净GMV]
+  caveats:
+    - 这里的退款是按订单支付时间归期扣减（即退款计入其所退订单的支付期间）
+    - 另一种常见口径是按 refund_time 归期扣减，两者结果不同。使用前必须先确认口径
+  owner: 数据团队
+
+- name: paid_order_count
+  display_name: 已支付订单数
+  description: 统计期内完成支付的订单数量
+  definition: COUNT(DISTINCT orders.order_id)
+  base_table: orders
+  time_column: pay_time
+  filters:
+    - orders.status IN ('paid', 'refunded')
+  aliases: [支付订单数, 成交单量, 订单量, 成交量]
+  caveats:
+    - 按 pay_time 归期。若要统计"下单量"应按 create_time 且不过滤状态
+  owner: 数据团队
+
+- name: aov
+  display_name: 客单价
+  description: 成交总额 ÷ 已支付订单数
+  definition: SUM(orders.amount) / NULLIF(COUNT(DISTINCT orders.order_id), 0)
+  base_table: orders
+  time_column: pay_time
+  filters:
+    - orders.status IN ('paid', 'refunded')
+  aliases: [客单价, 平均订单金额, 单均金额]
+  caveats:
+    - 分母是订单数不是人数。若要按人计算应改为用户数并用 AVG
+  owner: 数据团队
+
+- name: item_amount
+  display_name: 商品销售额
+  description: 商品维度的成交金额（折扣后）
+  definition: SUM(order_items.unit_price * order_items.quantity - order_items.discount)
+  base_table: order_items
+  time_table: orders
+  joins:
+    - JOIN orders ON orders.order_id = order_items.order_id
+  time_column: pay_time
+  filters:
+    - orders.status IN ('paid', 'refunded')
+    - orders.pay_time IS NOT NULL
+  aliases: [商品销售额, 商品成交额, 单品销售额, 类目销售额, 品类销售额, 畅销商品, 热销商品, 卖得最好, 卖得最多, 商品排名, 商品排行]
+  caveats:
+    - 商品维度只能用明细表计算，因为 orders.amount 是订单级的
+    - 订单级折扣已经分摊到每条明细的 discount 字段，因此要用 unit_price*quantity-discount，不能用 unit_price*quantity
+    - 归期仍按 orders.pay_time，不要按明细表自身的字段
+  owner: 数据团队
+
+- name: refund_amount
+  display_name: 退款金额
+  description: 统计期内发生的退款金额
+  definition: SUM(refunds.refund_amount)
+  base_table: refunds
+  time_column: refund_time
+  aliases: [退款额, 退款金额, 退货金额]
+  caveats:
+    - 按 refund_time 归期，与 gmv 的归期字段不同，做同比环比时要注意
+  owner: 数据团队
+
+- name: refund_rate
+  display_name: 退款率
+  description: 退款金额 ÷ 成交总额
+  definition: SUM(refunds.refund_amount) / NULLIF(SUM(orders.amount), 0)
+  base_table: orders
+  joins:
+    - LEFT JOIN refunds ON refunds.order_id = orders.order_id
+  time_column: pay_time
+  filters:
+    - orders.status IN ('paid', 'refunded')
+  aliases: [退款率, 退货率]
+  caveats:
+    - 分子按订单支付时间归期扣减，不是按退款发生时间
+  owner: 数据团队
+
+- name: pay_conversion_rate
+  display_name: 支付转化率
+  description: 已支付订单数 ÷ 全部下单数
+  definition: COUNT(DISTINCT CASE WHEN orders.pay_time IS NOT NULL THEN orders.order_id END) * 1.0 / NULLIF(COUNT(DISTINCT orders.order_id), 0)
+  base_table: orders
+  time_column: create_time
+  aliases: [支付转化率, 转化率, 成交转化]
+  caveats:
+    - 这个指标按 create_time 归期，和成交类指标的归期字段不同
+  owner: 数据团队
+
+- name: new_users
+  display_name: 新增用户数
+  description: 统计期内注册的用户数
+  definition: COUNT(DISTINCT users.user_id)
+  base_table: users
+  time_column: register_time
+  aliases: [新增用户, 新客数, 注册用户数]
+  caveats:
+    - 按注册时间统计，与交易行为无关
+  owner: 数据团队
+
+- name: active_users
+  display_name: 活跃用户数
+  description: 统计期内产生过页面行为的用户数
+  definition: COUNT(DISTINCT page_events.user_id)
+  base_table: page_events
+  time_column: event_time
+  aliases: [活跃用户, DAU, 日活, 月活]
+  caveats:
+    - 这里定义的是"有埋点行为"的用户，不等于有下单的用户
+  owner: 数据团队
