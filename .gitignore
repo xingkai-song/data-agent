@@ -5,5 +5,7 @@ __pycache__/
 .env
 data/*.duckdb
 data/*.duckdb.wal
+data/*.sqlite
+artifacts/
 eval/results/
 .pytest_cache/
