@@ -93,6 +93,26 @@ def test_run_sql_returns_handle_and_preview(registry, ctx):
     assert res.data["columns"] == ["n"]
     assert res.data["handle"].startswith("rs_")
     assert res.data["row_count"] == 1
+    assert res.data["empty"] is False
+
+
+def test_aggregate_over_no_rows_is_marked_empty(registry, ctx):
+    """回归测试：聚合查询查不到数据时返回的是一行 NULL，不是空结果集。
+
+    只判断 row_count == 0 会漏掉这种情况，Agent 会误以为查到了数据，
+    然后在结论里写"成交额是 NULL"。
+    """
+    res = call(
+        registry, ctx, "run_sql",
+        sql=(
+            "SELECT SUM(amount) AS gmv FROM orders "
+            "WHERE pay_time >= TIMESTAMP '2019-01-01' "
+            "AND pay_time < TIMESTAMP '2019-02-01'"
+        ),
+    )
+    assert res.ok, res.error
+    assert res.data["row_count"] == 1        # 确实是 1 行
+    assert res.data["empty"] is True         # 但内容为空
 
 
 def test_run_sql_applies_limit(registry, ctx):

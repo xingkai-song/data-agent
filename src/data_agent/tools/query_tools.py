@@ -196,6 +196,17 @@ class RunSqlOutput(BaseModel):
     preview: list[list]
     applied_tables: list[str] = Field(default_factory=list)
     limit_applied: int | None = None
+    truncated: bool = Field(
+        default=False,
+        description="结果是否真的被 LIMIT 截断了（行数正好等于上限时才为 true）",
+    )
+    empty: bool = Field(
+        default=False,
+        description=(
+            "结果是否等于没有数据。注意：聚合查询查不到数据时返回的不是 0 行，"
+            "而是一行 NULL，所以这两种情况都要算 empty。"
+        ),
+    )
 
 
 @tool(
@@ -249,6 +260,14 @@ def run_sql(inp: RunSqlInput, ctx: ToolContext) -> RunSqlOutput:
         ) from exc
 
     handle = ctx.results.put(columns, rows, source="run_sql")
+    # 只有"行数正好顶到上限"才是真的被截断。
+    # 否则聚合查询（返回 1 行）也会被误判为截断，白白触发一次修正循环。
+    truncated = guard.limit_applied is not None and len(rows) >= guard.limit_applied
+    # 关键：SQL 里 SUM/AVG/MAX 在没有匹配行时返回一行 NULL，不是空结果集。
+    # 如果只判断 row_count == 0，就会把"什么都没查到"误认为"查到了"。
+    empty = len(rows) == 0 or all(
+        cell is None for row in rows[:50] for cell in row
+    )
     return RunSqlOutput(
         handle=handle,
         columns=list(columns),
@@ -256,6 +275,8 @@ def run_sql(inp: RunSqlInput, ctx: ToolContext) -> RunSqlOutput:
         preview=[list(r) for r in rows[:5]],
         applied_tables=guard.tables,
         limit_applied=guard.limit_applied,
+        truncated=truncated,
+        empty=empty,
     )
 
 
