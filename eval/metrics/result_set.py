@@ -232,6 +232,112 @@ def _sort_token(value: Any) -> tuple:
     return (2, str(value))
 
 
+# ----------------------------------------------------------------------
+# 排序检查
+# ----------------------------------------------------------------------
+
+
+def extract_sort_key(sql: str, dialect: str = "duckdb") -> tuple[str, bool] | None:
+    """从 SQL 里解析出第一个 ORDER BY 表达式和方向。
+
+    返回 (列名或别名, 是否降序)。解析不出来就返回 None。
+
+    为什么要解析而不是硬编码：排序要求应该由标准 SQL 自己声明，
+    不然任务集和评测逻辑会各说各话。
+    """
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except ImportError:  # pragma: no cover
+        return None
+    try:
+        root = sqlglot.parse_one(sql, read=dialect)
+    except Exception:  # noqa: BLE001
+        return None
+    order = root.args.get("order")
+    if not order or not getattr(order, "expressions", None):
+        return None
+    first = order.expressions[0]
+    target = first.this
+    if isinstance(target, exp.Column):
+        name = target.name
+    elif isinstance(target, exp.Literal):
+        # ORDER BY 1 这种位置引用拿不到列名，用第一个投影列兜底
+        name = ""
+        if isinstance(root, exp.Select) and root.expressions:
+            projection = root.expressions[0]
+            name = getattr(projection, "alias_or_name", "") or ""
+    else:
+        name = getattr(target, "alias_or_name", "") or ""
+    if not name:
+        return None
+    return name, bool(first.args.get("desc"))
+
+
+def compare_ordered(
+    golden: ResultSet,
+    candidate: ResultSet,
+    *,
+    sort_column: str,
+    descending: bool,
+    abs_tol: float = 1e-6,
+    rel_tol: float = 1e-9,
+    allow_extra_columns: bool = True,
+) -> CompareResult:
+    """带排序要求的比对。
+
+    关键取舍：**不按整行位置比对，而是「行集合一致 + 候选按排序键单调有序」**。
+
+    原因是并列值。比如"各城市成交额排名"里两个城市成交额相同，
+    它们在标准答案里的先后是任意的；如果按位置严格比对，
+    Agent 只要把这两个城市换个顺序就会被判错——而它的排名其实是对的。
+    第一版就是这么写的，自检时同一条标准 SQL 和自己比都会随机失败。
+    """
+    # 先做形状无关的行集合比对
+    base = compare_result_sets(
+        golden,
+        candidate,
+        abs_tol=abs_tol,
+        rel_tol=rel_tol,
+        order_matters=False,
+        allow_extra_columns=allow_extra_columns,
+    )
+    if not base.matched:
+        return base
+
+    if sort_column not in golden.columns:
+        base.reason = f"{base.reason}（未找到排序键列 {sort_column}，跳过排序检查）"
+        return base
+
+    projected = _project_candidate(golden, candidate, abs_tol, rel_tol)
+    if projected is None:
+        return base
+    idx = golden.columns.index(sort_column)
+    values = [row[idx] for row in projected.rows]
+
+    for a, b in zip(values, values[1:]):
+        if a is None or b is None:
+            continue
+        if not _is_number(a) or not _is_number(b):
+            continue
+        fa, fb = _to_float(a), _to_float(b)
+        if descending and fb > fa + abs_tol:
+            base.matched = False
+            base.reason = (
+                f"排序不正确：{sort_column} 应降序，但出现 {fa} 在 {fb} 之前"
+            )
+            return base
+        if not descending and fb < fa - abs_tol:
+            base.matched = False
+            base.reason = (
+                f"排序不正确：{sort_column} 应升序，但出现 {fa} 在 {fb} 之前"
+            )
+            return base
+
+    base.reason = "行集合一致且排序正确"
+    return base
+
+
 def numeric_columns_covered(
     golden: ResultSet,
     candidate: ResultSet,

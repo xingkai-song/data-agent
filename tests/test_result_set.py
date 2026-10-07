@@ -16,7 +16,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from eval.metrics.result_set import (
     ResultSet,
+    compare_ordered,
     compare_result_sets,
+    extract_sort_key,
     numeric_columns_covered,
 )
 
@@ -215,3 +217,70 @@ def test_numeric_partial_coverage_fails():
     ok, missing = numeric_columns_covered(golden, candidate)
     assert not ok
     assert missing == ["b"]
+
+
+# ---------- 排序检查 ----------
+
+
+def test_extract_sort_key_desc():
+    assert extract_sort_key("SELECT a, b FROM t ORDER BY b DESC") == ("b", True)
+
+
+def test_extract_sort_key_asc_default():
+    assert extract_sort_key("SELECT a, b FROM t ORDER BY b") == ("b", False)
+
+
+def test_extract_sort_key_position_reference():
+    """ORDER BY 1 这种位置引用要能兜底到第一个投影列。"""
+    assert extract_sort_key("SELECT city, gmv FROM t ORDER BY 1") == ("city", False)
+
+
+def test_extract_sort_key_returns_none_without_order_by():
+    assert extract_sort_key("SELECT a FROM t") is None
+
+
+def test_ordered_tolerates_swapped_ties():
+    """并列值换顺序不该判错。
+
+    真实案例：两个城市成交额相同，标准答案里的先后是任意的，
+    Agent 换个顺序不代表排名错。第一版按整行位置比对，
+    结果自检时同一条标准 SQL 和自己比都会随机失败。
+    """
+    golden = rs(["city", "gmv"], [["上海", 100.0], ["北京", 80.0], ["广州", 80.0]])
+    candidate = rs(["city", "gmv"], [["上海", 100.0], ["广州", 80.0], ["北京", 80.0]])
+    res = compare_ordered(
+        golden, candidate, sort_column="gmv", descending=True
+    )
+    assert res.matched, res.reason
+
+
+def test_ordered_catches_wrong_ranking():
+    """但真正的排序错误必须抓住——否则这个检查就是摆设。"""
+    golden = rs(["city", "gmv"], [["上海", 100.0], ["北京", 80.0]])
+    candidate = rs(["city", "gmv"], [["北京", 80.0], ["上海", 100.0]])
+    res = compare_ordered(golden, candidate, sort_column="gmv", descending=True)
+    assert not res.matched
+    assert "排序不正确" in res.reason
+
+
+def test_ordered_catches_ascending_when_descending_required():
+    golden = rs(["c", "v"], [["a", 3.0], ["b", 2.0], ["c", 1.0]])
+    candidate = rs(["c", "v"], [["c", 1.0], ["b", 2.0], ["a", 3.0]])
+    res = compare_ordered(golden, candidate, sort_column="v", descending=True)
+    assert not res.matched
+
+
+def test_ordered_still_requires_correct_values():
+    golden = rs(["c", "v"], [["a", 3.0], ["b", 2.0]])
+    candidate = rs(["c", "v"], [["a", 3.0], ["b", 999.0]])
+    res = compare_ordered(golden, candidate, sort_column="v", descending=True)
+    assert not res.matched
+
+
+def test_ordered_with_extra_columns():
+    golden = rs(["city", "gmv"], [["上海", 100.0], ["北京", 80.0]])
+    candidate = rs(
+        ["city", "gmv", "orders"], [["上海", 100.0, 3], ["北京", 80.0, 2]]
+    )
+    res = compare_ordered(golden, candidate, sort_column="gmv", descending=True)
+    assert res.matched, res.reason

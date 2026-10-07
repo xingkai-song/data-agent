@@ -20,6 +20,7 @@ from data_agent.infra.db import Warehouse  # noqa: E402
 from eval.gate import (  # noqa: E402
     GateFailure,
     _load_thresholds,
+    check_determinism,
     check_negative,
     check_sanity,
     check_task_set,
@@ -52,6 +53,16 @@ def test_sanity_passes(tasks, cfg):
 
 def test_negative_cases_are_all_caught(tasks, cfg):
     assert check_negative(tasks, cfg["offline"]) == 0.0
+
+
+def test_ordered_tasks_are_deterministic(tasks):
+    """带排序要求的任务必须可重复。
+
+    真踩过：T35 的 ORDER BY 有并列值，加上 order_matters 之后
+    自检会随机失败——同一条标准 SQL 和自己比都不相等。
+    修法是加唯一 tiebreaker，这条测试防止以后新增任务再犯。
+    """
+    assert check_determinism(tasks, repeats=3) == []
 
 
 # ---------- 关键：每条负例必须真的和标准答案不同 ----------

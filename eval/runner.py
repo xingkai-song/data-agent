@@ -30,7 +30,9 @@ for p in (PROJECT_ROOT / "src", PROJECT_ROOT):
 from data_agent.infra.db import Warehouse  # noqa: E402
 from eval.metrics.result_set import (  # noqa: E402
     ResultSet,
+    compare_ordered,
     compare_result_sets,
+    extract_sort_key,
     numeric_columns_covered,
 )
 from eval.report import now_iso, write_report  # noqa: E402
@@ -156,13 +158,29 @@ def evaluate(
                 if covered:
                     record["numeric_match"] = True
 
-                cmp_res = compare_result_sets(
-                    golden,
-                    candidate,
-                    abs_tol=float(t.get("tolerance", 1e-6)),
-                    order_matters=bool(t.get("order_matters", False)),
-                    allow_extra_columns=allow_extra_columns,
+                tolerance = float(t.get("tolerance", 1e-6))
+                sort_key = (
+                    extract_sort_key(t["reference_sql"])
+                    if t.get("order_matters")
+                    else None
                 )
+                if sort_key:
+                    cmp_res = compare_ordered(
+                        golden,
+                        candidate,
+                        sort_column=sort_key[0],
+                        descending=sort_key[1],
+                        abs_tol=tolerance,
+                        allow_extra_columns=allow_extra_columns,
+                    )
+                else:
+                    cmp_res = compare_result_sets(
+                        golden,
+                        candidate,
+                        abs_tol=tolerance,
+                        order_matters=bool(t.get("order_matters", False)),
+                        allow_extra_columns=allow_extra_columns,
+                    )
                 last_reason = cmp_res.reason
                 last_mismatches = cmp_res.mismatches
                 if cmp_res.matched:

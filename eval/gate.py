@@ -114,6 +114,31 @@ def check_sanity(tasks: list[dict], cfg: dict) -> float:
     return rate
 
 
+def check_determinism(tasks: list[dict], *, repeats: int = 3) -> list[str]:
+    """标准 SQL 必须可重复：同一条跑多次结果要完全一致。
+
+    真踩过这个坑：T35 的 `ORDER BY conversion DESC` 有并列值，
+    DuckDB 并行执行时并列行的顺序不稳定，而该任务开了 order_matters，
+    于是"自检"会随机失败——同一条标准 SQL 和自己比都不相等。
+
+    这类问题只在特定并发度下复现，靠人工测很容易漏。所以做成门禁的固定检查：
+    凡是带排序要求的任务，跑多次必须完全一致。修法是给 ORDER BY 加唯一 tiebreaker。
+    """
+    problems: list[str] = []
+    ordered = [t for t in tasks if t.get("order_matters") and t.get("reference_sql")]
+    if not ordered:
+        return problems
+    with Warehouse() as wh:
+        for t in ordered:
+            signatures = {repr(wh.query(t["reference_sql"])) for _ in range(repeats)}
+            if len(signatures) > 1:
+                problems.append(
+                    f"任务 {t['id']} 的标准 SQL 多次执行结果不一致"
+                    f"（ORDER BY 可能有并列值，需要加唯一 tiebreaker）"
+                )
+    return problems
+
+
 def check_negative(tasks: list[dict], cfg: dict) -> float:
     """典型错误答案必须全被抓住。证明 harness 真的能识别错误。
 
@@ -245,6 +270,11 @@ def main() -> None:
     for w in check_task_set(tasks, cfg["offline"]):
         print(f"  {w}")
     print("  [通过] 评测集合法性检查")
+
+    flaky = check_determinism(tasks)
+    if flaky:
+        raise GateFailure("标准 SQL 结果不稳定：\n  - " + "\n  - ".join(flaky))
+    print("  [通过] 标准 SQL 可重复性检查（带排序的任务各跑 3 次）")
 
     sanity = check_sanity(tasks, cfg["offline"])
     print(f"  [通过] 自检（标准 SQL 当预测）：{sanity:.1%}")
