@@ -28,7 +28,11 @@ for p in (PROJECT_ROOT / "src", PROJECT_ROOT):
         sys.path.insert(0, str(p))
 
 from data_agent.infra.db import Warehouse  # noqa: E402
-from eval.metrics.result_set import ResultSet, compare_result_sets  # noqa: E402
+from eval.metrics.result_set import (  # noqa: E402
+    ResultSet,
+    compare_result_sets,
+    numeric_columns_covered,
+)
 from eval.report import now_iso, write_report  # noqa: E402
 
 TASKS_PATH = PROJECT_ROOT / "eval" / "datasets" / "tasks.jsonl"
@@ -45,16 +49,22 @@ def load_tasks(path: Path = TASKS_PATH) -> list[dict[str, Any]]:
     return tasks
 
 
-def load_predictions(path: Path) -> dict[str, str]:
-    preds: dict[str, str] = {}
+def load_predictions(path: Path) -> dict[str, list[str]]:
+    """读取预测文件。
+
+    每条记录的候选查询可能是单个 `sql`，也可能是 `sqls` 列表
+    （Agent 在一次分析里可能执行多次查询）。统一成列表。
+    """
+    preds: dict[str, list[str]] = {}
     with path.open(encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             obj = json.loads(line)
-            if obj.get("sql"):
-                preds[obj["id"]] = obj["sql"]
+            candidates = obj.get("sqls") or ([obj["sql"]] if obj.get("sql") else [])
+            if candidates:
+                preds[obj["id"]] = [c for c in candidates if c]
     return preds
 
 
@@ -66,13 +76,21 @@ def run_sql(wh: Warehouse, sql: str) -> ResultSet:
 
 def evaluate(
     tasks: list[dict[str, Any]],
-    predictions: dict[str, str],
+    predictions: dict[str, str | list[str]],
     *,
     source: str,
-    order_matters_map: dict[str, bool] | None = None,
+    allow_extra_columns: bool = True,
+    mode: str = "best",
 ) -> dict[str, Any]:
+    """评测。
+
+    mode="best"：候选集是 Agent 执行过的全部查询，命中任意一条即通过。
+                 衡量的是"它是否算出了正确结果"。
+    mode="last"：只取最后一次查询，且要求列完全一致。
+                 更严格，但对"做完主查询又跑了验证查询"的 Agent 不公平。
+    两个口径都报，避免只给一个好看的数字。
+    """
     results: list[dict[str, Any]] = []
-    order_matters_map = order_matters_map or {}
 
     with Warehouse() as wh:
         for t in tasks:
@@ -96,43 +114,72 @@ def evaluate(
                 results.append(record)
                 continue
 
-            sql = predictions.get(tid)
-            if not sql:
+            raw = predictions.get(tid)
+            if raw is None:
                 record["reason"] = "缺少预测"
                 record["latency_ms"] = (time.perf_counter() - started) * 1000
                 results.append(record)
                 continue
 
-            try:
-                candidate = run_sql(wh, sql)
-            except Exception as exc:
-                record["reason"] = f"SQL 执行失败：{type(exc).__name__}: {exc}"
-                record["mismatches"].append(str(exc).strip().splitlines()[0][:200])
-                record["latency_ms"] = (time.perf_counter() - started) * 1000
-                results.append(record)
-                continue
+            candidates = [raw] if isinstance(raw, str) else list(raw)
+            if mode == "last":
+                candidates = candidates[-1:]
 
-            cmp_res = compare_result_sets(
-                golden,
-                candidate,
-                abs_tol=float(t.get("tolerance", 1e-6)),
-                order_matters=order_matters_map.get(tid, t.get("order_matters", False)),
-            )
-            record.update(
-                {
-                    "matched": cmp_res.matched,
-                    "reason": cmp_res.reason,
-                    "mismatches": cmp_res.mismatches,
-                    "golden_rows": cmp_res.golden_rows,
-                    "candidate_rows": cmp_res.candidate_rows,
-                }
-            )
+            last_reason = ""
+            last_mismatches: list[str] = []
+            record["candidates_tried"] = len(candidates)
+
+            for candidate_sql in candidates:
+                try:
+                    candidate = run_sql(wh, candidate_sql)
+                except Exception as exc:
+                    last_reason = f"SQL 执行失败：{type(exc).__name__}: {exc}"
+                    last_mismatches = [str(exc).strip().splitlines()[0][:200]]
+                    continue
+
+                # 形状无关的数值一致性：只要跑过一次候选查询，就把结果并进这个指标
+                covered, missing = numeric_columns_covered(
+                    golden,
+                    candidate,
+                    abs_tol=float(t.get("tolerance", 1e-6)),
+                )
+                if covered:
+                    record["numeric_match"] = True
+
+                cmp_res = compare_result_sets(
+                    golden,
+                    candidate,
+                    abs_tol=float(t.get("tolerance", 1e-6)),
+                    order_matters=bool(t.get("order_matters", False)),
+                    allow_extra_columns=allow_extra_columns,
+                )
+                last_reason = cmp_res.reason
+                last_mismatches = cmp_res.mismatches
+                if cmp_res.matched:
+                    record.update(
+                        {
+                            "matched": True,
+                            "reason": cmp_res.reason,
+                            "mismatches": [],
+                            "golden_rows": cmp_res.golden_rows,
+                            "candidate_rows": cmp_res.candidate_rows,
+                            "matched_candidate": candidate_sql[:300],
+                        }
+                    )
+                    break
+            else:
+                record["reason"] = last_reason or "所有候选查询都未通过"
+                record["mismatches"] = last_mismatches
+
             record["latency_ms"] = (time.perf_counter() - started) * 1000
+            record.setdefault("numeric_match", False)
             results.append(record)
 
     return {
         "created_at": now_iso(),
         "source": source,
+        "mode": mode,
+        "allow_extra_columns": allow_extra_columns,
         "warehouse": str(PROJECT_ROOT / "data" / "warehouse.duckdb"),
         "results": results,
     }
@@ -142,7 +189,19 @@ def print_summary(run: dict[str, Any]) -> None:
     rows = run["results"]
     total = len(rows)
     passed = sum(1 for r in rows if r["matched"])
-    print(f"\n结果集精确比对：{passed}/{total} = {passed / total * 100:.1f}%")
+    print(f"\n结果集一致率（允许额外辅助列）：{passed}/{total} = {passed / total * 100:.1f}%")
+    if "strict" in run:
+        s = run["strict"]
+        print(
+            f"形状完全一致率（列数与取值都必须一致）："
+            f"{s['passed']}/{s['total']} = {s['passed'] / max(s['total'], 1) * 100:.1f}%"
+        )
+    if "numeric" in run:
+        n = run["numeric"]
+        print(
+            f"数值列一致率（形状无关，只查数字对不对）："
+            f"{n['passed']}/{n['total']} = {n['passed'] / max(n['total'], 1) * 100:.1f}%"
+        )
     for r in rows:
         flag = "PASS" if r["matched"] else "FAIL"
         print(f"  [{flag}] {r['id']} ({r['difficulty']:<6s}) {r['question']}")
@@ -184,7 +243,25 @@ def main() -> None:
         return
 
     try:
-        run = evaluate(tasks, predictions, source=source)
+        run = evaluate(
+            tasks, predictions, source=source, allow_extra_columns=True, mode="best"
+        )
+        # 同时按严格口径跑一遍：只取最后一次查询、要求列完全一致。
+        # 两个数都报，避免只呈现对自己有利的那个。
+        # 严格口径：候选集同样是全部查询，但要求列数与取值都完全一致
+        strict = evaluate(
+            tasks, predictions, source=source, allow_extra_columns=False, mode="best"
+        )
+        run["strict"] = {
+            "passed": sum(1 for r in strict["results"] if r["matched"]),
+            "total": len(strict["results"]),
+            "mode": "best-exact-shape",
+            "results": strict["results"],
+        }
+        run["numeric"] = {
+            "passed": sum(1 for r in run["results"] if r.get("numeric_match")),
+            "total": len(run["results"]),
+        }
     except Exception:
         traceback.print_exc()
         raise SystemExit(1)

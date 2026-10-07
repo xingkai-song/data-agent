@@ -39,7 +39,27 @@ def render_report(run: dict[str, Any]) -> str:
     out.append(f"- 预测来源：{run['source']}")
     out.append(f"- 数据快照：{run.get('warehouse', 'unknown')}")
     out.append(f"- 任务总数：{total}")
-    out.append(f"- **结果集精确比对通过率：{passed}/{total} = {_pct(accuracy)}**\n")
+    mode_label = (
+        "任一查询命中（Agent 执行过的查询里有一条与标准一致）"
+        if run.get("mode") == "best"
+        else "最后一次查询命中"
+    )
+    out.append(f"- 评测口径：{mode_label}")
+    out.append(f"- **结果集一致率（允许额外辅助列）：{passed}/{total} = {_pct(accuracy)}**")
+    if "strict" in run:
+        s = run["strict"]
+        strict_acc = s["passed"] / max(s["total"], 1)
+        out.append(
+            f"- 形状完全一致率（列数与取值都必须一致）："
+            f"{s['passed']}/{s['total']} = {_pct(strict_acc)}"
+        )
+    if "numeric" in run:
+        n = run["numeric"]
+        out.append(
+            f"- 数值列一致率（形状无关，只查数字对不对）："
+            f"{n['passed']}/{n['total']} = {_pct(n['passed'] / max(n['total'], 1))}"
+        )
+    out.append("")
 
     out.append("## 总体结果\n")
     out.append(tabulate(

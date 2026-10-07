@@ -36,17 +36,24 @@ from eval.runner import load_tasks  # noqa: E402
 PRED_DIR = PROJECT_ROOT / "eval" / "predictions"
 
 
-def last_successful_sql(result) -> str | None:
-    """取最后一次成功的 run_sql 语句。
+def all_successful_sqls(result) -> list[str]:
+    """收集 Agent 执行过的全部成功查询。
 
-    这是"Agent 最终据以作答的那次查询"。多步任务里可能有多次查询，
-    但结论通常来自最后一次（或最关键的那次）。
+    为什么不只取最后一条：跑真实评测时发现，Agent 在主查询之后
+    常常还会跑验证性查询（比如为了展示不同口径的差异而多做一次对照）。
+    只取最后一条会拿到对照查询，把答对的题判成错的。
+    所以评测的候选集是**它执行过的全部查询**，命中任意一条即算通过。
     """
-    sqls = [
+    return [
         c["arguments"].get("sql")
         for c in result.tool_calls
         if c["name"] == "run_sql" and c.get("ok") and c["arguments"].get("sql")
     ]
+
+
+def last_successful_sql(result) -> str | None:
+    """最后一次成功的查询（保留这个口径用于对照）。"""
+    sqls = all_successful_sqls(result)
     return sqls[-1] if sqls else None
 
 
@@ -80,7 +87,8 @@ def main() -> None:
 
     for t in tasks:
         r = agent.run(t["question"], as_of=t.get("as_of"))
-        sql = last_successful_sql(r)
+        sqls = all_successful_sqls(r)
+        sql = sqls[-1] if sqls else None
         status_mark = {"answered": "OK", "clarified": "澄清", "stopped": "熔断"}.get(
             r.status, r.status
         )
@@ -89,12 +97,13 @@ def main() -> None:
             f"工具={len(r.tool_calls)}  token={int(r.usage.get('input_tokens', 0) + r.usage.get('output_tokens', 0))}  "
             f"{r.elapsed_s:.1f}s"
         )
-        if not sql:
+        if not sqls:
             print(f"         └─ 未产出可评测的 SQL（status={r.status}, reason={r.stop_reason}）")
         records.append(
             {
                 "id": t["id"],
                 "sql": sql,
+                "sqls": sqls,
                 "agent_status": r.status,
                 "stop_reason": r.stop_reason,
                 "steps": r.steps,

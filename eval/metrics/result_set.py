@@ -107,6 +107,7 @@ def compare_result_sets(
     abs_tol: float = 1e-6,
     rel_tol: float = 1e-9,
     order_matters: bool = False,
+    allow_extra_columns: bool = False,
     max_reported: int = 5,
 ) -> CompareResult:
     """比对两个结果集。
@@ -122,6 +123,12 @@ def compare_result_sets(
     不同量纲的指标允许的误差本来就不同，所以容差应该是**任务级配置**：
     金额类任务在 tasks.jsonl 里声明 abs=0.01（一分钱），
     比率类任务声明 abs=1e-4。全局默认保持严格。
+
+    allow_extra_columns=True 时，允许候选结果多带辅助列（例如回答成交额时
+    顺便带上订单数）。做法是先把标准列按"取值的多重集"匹配到候选列，
+    再投影出来逐行比对。
+    这**不等于放宽正确性**：匹配上的列仍要逐行一致；如果主指标算错了
+    （比如用 create_time 归期），第一阶段的取值匹配就会失败。
     """
     res = CompareResult(
         matched=False,
@@ -129,11 +136,23 @@ def compare_result_sets(
         candidate_rows=candidate.n_rows,
     )
 
-    if golden.n_cols != candidate.n_cols:
+    if golden.n_cols != candidate.n_cols and not allow_extra_columns:
         res.reason = f"列数不一致：标准 {golden.n_cols} 列，实际 {candidate.n_cols} 列"
         res.mismatches.append(f"标准列：{golden.columns}")
         res.mismatches.append(f"实际列：{candidate.columns}")
         return res
+
+    if allow_extra_columns and candidate.n_cols != golden.n_cols:
+        projected = _project_candidate(golden, candidate, abs_tol, rel_tol)
+        if projected is None:
+            res.reason = (
+                f"候选结果的 {candidate.n_cols} 列里找不到与标准 {golden.n_cols} "
+                f"列取值一致的列"
+            )
+            res.mismatches.append(f"标准列：{golden.columns}")
+            res.mismatches.append(f"候选列：{candidate.columns}")
+            return res
+        candidate = projected
 
     if golden.n_rows != candidate.n_rows:
         res.reason = f"行数不一致：标准 {golden.n_rows} 行，实际 {candidate.n_rows} 行"
@@ -164,3 +183,98 @@ def compare_result_sets(
     res.matched = True
     res.reason = "完全一致"
     return res
+
+
+def _project_candidate(
+    golden: ResultSet,
+    candidate: ResultSet,
+    abs_tol: float,
+    rel_tol: float,
+) -> ResultSet | None:
+    """把候选结果投影成与标准列对应的子集。
+
+    列名不可靠（模型起的别名五花八门），所以按**取值的多重集**匹配：
+    排序后逐个比较，一致就认为这两列是同一个东西。
+    """
+    used: set[int] = set()
+    chosen: list[int] = []
+
+    for j in range(golden.n_cols):
+        g_vals = sorted((row[j] for row in golden.rows), key=_sort_token)
+        found: int | None = None
+        for k in range(candidate.n_cols):
+            if k in used:
+                continue
+            c_vals = sorted((row[k] for row in candidate.rows), key=_sort_token)
+            if len(c_vals) != len(g_vals):
+                continue
+            if all(
+                _cell_close(a, b, abs_tol, rel_tol) for a, b in zip(g_vals, c_vals)
+            ):
+                found = k
+                break
+        if found is None:
+            return None
+        used.add(found)
+        chosen.append(found)
+
+    return ResultSet(
+        columns=[golden.columns[i] for i in range(golden.n_cols)],
+        rows=[tuple(row[k] for k in chosen) for row in candidate.rows],
+    )
+
+
+def _sort_token(value: Any) -> tuple:
+    if _is_number(value):
+        return (0, _to_float(value))
+    if value is None:
+        return (1, 0.0)
+    return (2, str(value))
+
+
+def numeric_columns_covered(
+    golden: ResultSet,
+    candidate: ResultSet,
+    *,
+    abs_tol: float = 1e-6,
+    rel_tol: float = 1e-9,
+) -> tuple[bool, list[str]]:
+    """检查标准里的每个数值列，能否在候选里找到取值一致的列。
+
+    这是"形状无关"的补充指标，用来区分两种失败：
+      * 数字算错了 —— 数值列找不到对应，这个指标也会失败
+      * 只是标签写法不同（布尔值 vs "VIP/普通"）或表格形状不同
+        —— 数值列仍能找到，这个指标通过
+
+    只对数值列做检查，因为标签的表示方式本来就没有唯一正确答案，
+    强行比对只会制造假失败。返回 (是否全部覆盖, 缺失的列名)。
+    """
+    missing: list[str] = []
+    used: set[int] = set()
+
+    for j in range(golden.n_cols):
+        g_vals = [row[j] for row in golden.rows]
+        if not g_vals or not all(_is_number(v) or v is None for v in g_vals):
+            continue  # 非数值列不参与
+        if all(v is None for v in g_vals):
+            continue
+
+        g_sorted = sorted(g_vals, key=_sort_token)
+        found = False
+        for k in range(candidate.n_cols):
+            if k in used:
+                continue
+            c_sorted = sorted((row[k] for row in candidate.rows), key=_sort_token)
+            if len(c_sorted) != len(g_sorted):
+                continue
+            if all(
+                _cell_close(a, b, abs_tol, rel_tol)
+                for a, b in zip(g_sorted, c_sorted)
+            ):
+                used.add(k)
+                found = True
+                break
+        if not found:
+            missing.append(golden.columns[j])
+
+    return (not missing), missing
