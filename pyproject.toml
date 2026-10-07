@@ -18,6 +18,18 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+# Agent 运行与可观测性依赖较重（会拉一堆传递依赖），
+# 单独放一组，跑离线测试时不需要装
+agent = [
+    "langgraph",
+    "openai>=1.0",
+    "python-dotenv",
+    "opentelemetry-api",
+    "opentelemetry-sdk",
+    "opentelemetry-exporter-otlp-proto-http",
+]
+# 服务化
+server = ["fastapi", "uvicorn", "httpx"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

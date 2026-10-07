@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from langgraph.graph import END, StateGraph
+from opentelemetry import trace as _otel_trace
 
 from data_agent.agent.policies import Budget, LoopGuard, RetryPolicy
 from data_agent.agent.prompts import (
@@ -59,6 +60,7 @@ class AgentRunResult:
     plan: list[str] = field(default_factory=list)
     selection: dict[str, Any] = field(default_factory=dict)
     elapsed_s: float = 0.0
+    trace_id: str | None = None
 
     @property
     def succeeded(self) -> bool:
@@ -437,6 +439,10 @@ class DataAgent:
                 selection=final.get("selection", {}),
                 elapsed_s=time.perf_counter() - started,
             )
+            # 记下 trace id：服务化之后要靠它把「这次请求」和「这次轨迹」关联起来
+            span_ctx = _otel_trace.get_current_span().get_span_context()
+            if span_ctx and span_ctx.is_valid:
+                result.trace_id = f"{span_ctx.trace_id:032x}"
             turn_span.set(
                 **{
                     "agent.status": result.status,
