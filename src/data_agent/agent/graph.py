@@ -38,8 +38,9 @@ from data_agent.agent.prompts import (
 )
 from data_agent.agent.state import AgentState, new_state
 from data_agent.llm.base import LLMClient
+from data_agent.observability.tracing import AgentTracer, setup_tracing
 from data_agent.semantic.context_builder import build_context
-from data_agent.tools.base import ToolContext
+from data_agent.tools.base import ErrorKind, ToolContext
 from data_agent.tools.registry import ToolRegistry
 
 
@@ -74,6 +75,7 @@ class DataAgent:
         loop_guard: LoopGuard | None = None,
         budget: Budget | None = None,
         retry: RetryPolicy | None = None,
+        tracer: AgentTracer | None = None,
     ):
         self.llm = llm
         self.registry = registry
@@ -81,8 +83,14 @@ class DataAgent:
         self.loop_guard = loop_guard or LoopGuard()
         self.budget = budget or Budget()
         self.retry = retry or RetryPolicy()
+        # 默认关闭埋点，避免测试和一次性脚本产生额外开销
+        self.tracer = tracer or setup_tracing(enabled=False)
         self._started_at = 0.0
         self._graph = self._build_graph()
+
+    @property
+    def _model_name(self) -> str:
+        return getattr(self.llm, "model", "unknown")
 
     # ------------------------------------------------------------------
     # 图组装
@@ -121,22 +129,29 @@ class DataAgent:
 
         intent: dict[str, Any] = {}
         usage = dict(state.get("usage", {}))
-        try:
-            resp = self.llm.complete(
-                [
-                    {"role": "system", "content": "你只输出 JSON。"},
-                    {
-                        "role": "user",
-                        "content": UNDERSTAND_PROMPT.format(question=question, as_of=as_of),
-                    },
-                ],
-                response_format={"type": "json_object"},
-            )
-            intent = _parse_json(resp.content)
-            usage = _add_usage(state, resp.usage, llm_calls=1)
-        except Exception as exc:  # noqa: BLE001
-            # 意图识别失败不该让整个任务失败，降级为"直接执行"即可
-            intent = {"error": f"{type(exc).__name__}: {exc}"}
+        with self.tracer.node("understand") as span:
+            span.set(**{"agent.metrics": selection.metric_names()})
+            messages = [
+                {"role": "system", "content": "你只输出 JSON。"},
+                {
+                    "role": "user",
+                    "content": UNDERSTAND_PROMPT.format(question=question, as_of=as_of),
+                },
+            ]
+            with self.tracer.llm_call(
+                model=self._model_name, message_count=len(messages)
+            ) as h:
+                try:
+                    resp = self.llm.complete(
+                        messages, response_format={"type": "json_object"}
+                    )
+                    h.set_response(resp)
+                    intent = _parse_json(resp.content)
+                    usage = _add_usage(state, resp.usage, llm_calls=1)
+                except Exception as exc:  # noqa: BLE001
+                    # 意图识别失败不该让整个任务失败，降级为"直接执行"即可
+                    h.fail(exc, kind=type(exc).__name__)
+                    intent = {"error": f"{type(exc).__name__}: {exc}"}
 
         needs_clarification = bool(intent.get("needs_clarification"))
         plan = [str(x) for x in (intent.get("plan") or [])]
@@ -174,16 +189,36 @@ class DataAgent:
         if stop:
             return {"status": "stopped", "stop_reason": stop, "_next": "synthesize"}
 
+        # 用一个 step span 把"一次模型推理 + 它触发的工具调用"包在一起。
+        # 这样回放时能直接看出"失败发生在第几步"，而不是在一堆平铺的
+        # llm_call / execute_tool 里自己数。
+        with self.tracer.node("step") as step_span:
+            step_no = state.get("step", 0) + 1
+            step_span.set(**{"agent.step": step_no})
+            return self._act_step(state, step_no)
+
+    def _act_step(self, state: AgentState, step_no: int) -> dict[str, Any]:
         messages = list(state.get("messages", []))
-        try:
-            resp = self.llm.complete(messages, self.registry.schemas())
-        except Exception as exc:  # noqa: BLE001
-            return {
-                "status": "failed",
-                "stop_reason": f"模型调用失败：{type(exc).__name__}: {exc}",
-                "errors": [*state.get("errors", []), {"stage": "act", "error": str(exc)}],
-                "_next": "synthesize",
-            }
+        schemas = self.registry.schemas()
+        with self.tracer.llm_call(
+            model=self._model_name,
+            message_count=len(messages),
+            tool_count=len(schemas),
+        ) as h:
+            try:
+                resp = self.llm.complete(messages, schemas)
+                h.set_response(resp)
+            except Exception as exc:  # noqa: BLE001
+                h.fail(exc, kind=type(exc).__name__)
+                return {
+                    "status": "failed",
+                    "stop_reason": f"模型调用失败：{type(exc).__name__}: {exc}",
+                    "errors": [
+                        *state.get("errors", []),
+                        {"stage": "act", "error": str(exc)},
+                    ],
+                    "_next": "synthesize",
+                }
 
         usage = _add_usage(state, resp.usage, llm_calls=1)
 
@@ -222,9 +257,38 @@ class DataAgent:
         executed = 0
         for tc in resp.tool_calls:
             executed += 1
-            result, attempts = self.retry.call(
-                lambda tc=tc: self.registry.execute(tc.name, tc.arguments, self.tool_ctx)
-            )
+            with self.tracer.tool_call(
+                name=tc.name, call_id=tc.id, arguments=tc.arguments
+            ) as th:
+                result, attempts = self.retry.call(
+                    lambda tc=tc: self.registry.execute(
+                        tc.name, tc.arguments, self.tool_ctx
+                    )
+                )
+                summary = _summarize(result)
+                th.set(
+                    **{
+                        "agent.ok": result.ok,
+                        "agent.attempts": attempts,
+                        "agent.latency_ms": result.meta.get("latency_ms"),
+                        "agent.row_count": summary.get("row_count"),
+                        "agent.error_kind": (
+                            result.error_kind.value if result.error_kind else None
+                        ),
+                    }
+                )
+                if not result.ok and result.error_kind is not None:
+                    # 只有基础设施类故障才标记为 ERROR。
+                    # 参数错误、安全拦截是"正常工作流的一部分"——
+                    # 它们会被回灌给模型自我修正，不该污染失败率统计。
+                    if result.error_kind in (ErrorKind.TRANSIENT, ErrorKind.INTERNAL):
+                        th.fail(result.error or "工具失败", kind=result.error_kind.value)
+                    else:
+                        th.event(
+                            "tool_error",
+                            kind=result.error_kind.value,
+                            message=(result.error or "")[:200],
+                        )
             payload = result.model_dump(mode="json")
             tool_calls.append(
                 {
@@ -278,14 +342,16 @@ class DataAgent:
     # 节点 3：结果校验（确定性检查）
     # ------------------------------------------------------------------
     def _observe(self, state: AgentState) -> dict[str, Any]:
-        if state.get("status") in ("answered", "failed", "stopped"):
-            return {"_next": "synthesize"}
-        if not state.get("tool_calls"):
+        with self.tracer.node("observe") as span:
+            if state.get("status") in ("answered", "failed", "stopped"):
+                return {"_next": "synthesize"}
+            if not state.get("tool_calls"):
+                return {"_next": "act"}
+            issue = _diagnose(state)
+            span.set(**{"agent.diagnosis": issue})
+            if issue:
+                return {"diagnosis": issue, "_next": "reflect"}
             return {"_next": "act"}
-        issue = _diagnose(state)
-        if issue:
-            return {"diagnosis": issue, "_next": "reflect"}
-        return {"_next": "act"}
 
     # ------------------------------------------------------------------
     # 节点 4：修正（构造回灌提示，不调模型）
@@ -294,39 +360,50 @@ class DataAgent:
         hint = state.get("diagnosis")
         if not hint:
             return {}
-        messages = list(state.get("messages", []))
-        messages.append({"role": "user", "content": f"【系统检查】{hint}"})
-        reflections = list(state.get("reflections", []))
-        reflections.append(hint)
-        # 处理完要清空，否则下一次进入 observe 会读到旧的诊断结果
-        return {"messages": messages, "reflections": reflections, "diagnosis": None}
+        with self.tracer.node("reflect") as span:
+            span.event("self_check", hint=hint[:200])
+            messages = list(state.get("messages", []))
+            messages.append({"role": "user", "content": f"【系统检查】{hint}"})
+            reflections = list(state.get("reflections", []))
+            reflections.append(hint)
+            # 处理完要清空，否则下一次进入 observe 会读到旧的诊断结果
+            return {"messages": messages, "reflections": reflections, "diagnosis": None}
 
     # ------------------------------------------------------------------
     # 节点 5：结论组装（附加数据来源）
     # ------------------------------------------------------------------
     def _synthesize(self, state: AgentState) -> dict[str, Any]:
-        status = state.get("status", "running")
-        answer = state.get("final_answer")
+        with self.tracer.node("synthesize") as span:
+            status = state.get("status", "running")
+            answer = state.get("final_answer")
 
-        if status == "answered" and answer:
-            body: str | None = answer
-        elif status == "clarified":
-            body = None
-        else:
-            reason = state.get("stop_reason") or "未能完成分析"
-            body = (
-                f"未能完成这次分析（原因：{reason}）。\n\n"
-                "已经执行的操作如下，可以据此继续排查：\n"
-                + "\n".join(
-                    f"- {o.get('summary')}" for o in state.get("observations", [])[-5:]
+            if status == "answered" and answer:
+                body: str | None = answer
+            elif status == "clarified":
+                body = None
+            else:
+                reason = state.get("stop_reason") or "未能完成分析"
+                body = (
+                    f"未能完成这次分析（原因：{reason}）。\n\n"
+                    "已经执行的操作如下，可以据此继续排查：\n"
+                    + "\n".join(
+                        f"- {o.get('summary')}"
+                        for o in state.get("observations", [])[-5:]
+                    )
                 )
-            )
 
-        if body:
-            sources = _collect_sources(state)
-            if sources:
-                body = f"{body}\n\n---\n\n**数据来源**\n\n{sources}"
-        return {"final_answer": body}
+            sources = ""
+            if body:
+                sources = _collect_sources(state)
+                if sources:
+                    body = f"{body}\n\n---\n\n**数据来源**\n\n{sources}"
+            span.set(
+                **{
+                    "agent.status": status,
+                    "agent.source_count": len(sources.splitlines()) if sources else 0,
+                }
+            )
+            return {"final_answer": body}
 
     # ------------------------------------------------------------------
     # 对外入口
@@ -334,22 +411,46 @@ class DataAgent:
     def run(self, question: str, *, as_of: str | None = None) -> AgentRunResult:
         self._started_at = time.time()
         started = time.perf_counter()
-        final: dict[str, Any] = self._graph.invoke(new_state(question, as_of=as_of))
-        return AgentRunResult(
-            question=question,
-            status=final.get("status", "unknown"),
-            answer=final.get("final_answer"),
-            clarification=final.get("clarification"),
-            stop_reason=final.get("stop_reason"),
-            steps=final.get("step", 0),
-            tool_calls=final.get("tool_calls", []),
-            observations=final.get("observations", []),
-            usage=final.get("usage", {}),
-            intent=final.get("intent", {}),
-            plan=final.get("plan", []),
-            selection=final.get("selection", {}),
-            elapsed_s=time.perf_counter() - started,
-        )
+        with self.tracer.turn(question, as_of=as_of) as turn_span:
+            final: dict[str, Any] = self._graph.invoke(
+                new_state(question, as_of=as_of)
+            )
+            result = AgentRunResult(
+                question=question,
+                status=final.get("status", "unknown"),
+                answer=final.get("final_answer"),
+                clarification=final.get("clarification"),
+                stop_reason=final.get("stop_reason"),
+                steps=final.get("step", 0),
+                tool_calls=final.get("tool_calls", []),
+                observations=final.get("observations", []),
+                usage=final.get("usage", {}),
+                intent=final.get("intent", {}),
+                plan=final.get("plan", []),
+                selection=final.get("selection", {}),
+                elapsed_s=time.perf_counter() - started,
+            )
+            turn_span.set(
+                **{
+                    "agent.status": result.status,
+                    "agent.steps": result.steps,
+                    "agent.tool_calls": len(result.tool_calls),
+                    "agent.llm_calls": int(result.usage.get("llm_calls", 0)),
+                    "agent.input_tokens": int(result.usage.get("input_tokens", 0)),
+                    "agent.output_tokens": int(result.usage.get("output_tokens", 0)),
+                    "agent.elapsed_s": round(result.elapsed_s, 3),
+                    "agent.failed_tool_calls": sum(
+                        1 for c in result.tool_calls if not c.get("ok")
+                    ),
+                }
+            )
+            if result.status != "answered":
+                turn_span.event(
+                    "not_answered",
+                    status=result.status,
+                    reason=(result.stop_reason or "")[:200],
+                )
+            return result
 
 
 # ----------------------------------------------------------------------

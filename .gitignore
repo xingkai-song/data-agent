@@ -7,5 +7,7 @@ data/*.duckdb
 data/*.duckdb.wal
 data/*.sqlite
 artifacts/
+traces/
+eval/datasets/failure_candidates.jsonl
 eval/results/
 .pytest_cache/
