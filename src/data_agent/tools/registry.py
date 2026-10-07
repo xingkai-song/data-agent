@@ -60,6 +60,29 @@ class ToolRegistry:
             specs = [s for s in specs if s.category in categories]
         return [s.json_schema() for s in specs]
 
+    def compact_schemas(
+        self, *, categories: list[str] | None = None
+    ) -> list[dict[str, Any]]:
+        """精简版工具清单。
+
+        实测工具 schema 是每次 act 调用里最大的固定开销（约 1,639 token，
+        比 system prompt 和语义层上下文加起来还大），而其中相当一部分是
+        Pydantic 自动生成的噪声：
+
+          * 每个字段都带一个 `title`（Sql / Purpose / Handle …），零信息量
+          * 可选字段被包成 `anyOf: [{type: X}, {type: null}]`
+          * 可选字段的 `default: null`
+
+        这里只做**无损压缩**（不删任何有语义的约束）：去掉 title、
+        把 anyOf-null 合并成 `type: [X, "null"]`、去掉空默认值。
+        enum、description、required、min/max 这些一律保留——
+        它们才是模型判断怎么调工具的依据。
+        """
+        out = []
+        for schema in self.schemas(categories=categories):
+            out.append({**schema, "parameters": _compact(schema["parameters"])})
+        return out
+
     # ---- 执行 ----
     def execute(
         self,
@@ -155,6 +178,46 @@ def _format_validation_error(exc: ValidationError, spec: ToolSpec) -> str:
         lines.append(f"  - 字段 `{loc}`：{err.get('msg')}")
     lines.append(f"正确的参数结构：{spec.input_model.model_json_schema()}")
     return "\n".join(lines)
+
+
+# Pydantic 自动生成、但对模型没有信息量的键
+_NOISE_KEYS = {"title"}
+
+
+def _compact(node: Any) -> Any:
+    """递归精简 JSON Schema。只删噪声，不删约束。"""
+    if isinstance(node, list):
+        return [_compact(x) for x in node]
+    if not isinstance(node, dict):
+        return node
+
+    out: dict[str, Any] = {}
+    for key, value in node.items():
+        if key in _NOISE_KEYS:
+            continue
+        # 可选字段的空默认值没有信息量
+        if key == "default" and value is None:
+            continue
+        out[key] = _compact(value)
+
+    # anyOf: [{type: T}, {type: null}] -> type: [T, "null"]
+    any_of = out.get("anyOf")
+    if isinstance(any_of, list) and len(any_of) == 2:
+        null_part = next((x for x in any_of if x == {"type": "null"}), None)
+        other = next((x for x in any_of if x != {"type": "null"}), None)
+        if null_part is not None and isinstance(other, dict):
+            merged = {k: v for k, v in other.items() if k != "type"}
+            base_type = other.get("type")
+            if isinstance(base_type, str):
+                merged["type"] = [base_type, "null"]
+            elif isinstance(base_type, list):
+                merged["type"] = [*base_type, "null"]
+            else:
+                merged["type"] = "null"
+            out.pop("anyOf")
+            out = {**merged, **{k: v for k, v in out.items() if k != "type"}}
+            out.setdefault("type", merged["type"])
+    return out
 
 
 # 全局默认注册表

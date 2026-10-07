@@ -189,11 +189,28 @@ class RunSqlInput(BaseModel):
     )
 
 
+# 结果行数不超过这个值时全部回传给模型。
+#
+# 之前固定只回传 5 行预览，模型看不到剩下的行，于是出现两类失败：
+#   * 漏答——"销量前 10 的商品"它只看到 5 个，就把其余概括成"其余5个商品"
+#   * 编造——T37 的服饰品类订单数没落在前 5 行里，它直接编了一个约 900
+# 这是设计缺陷，不是模型能力问题：给了句柄却没有读取完整结果的途径。
+INLINE_ROW_LIMIT = 50
+
+
 class RunSqlOutput(BaseModel):
     handle: str = Field(description="结果句柄，后续分析工具用它取数")
     columns: list[str]
     row_count: int
-    preview: list[list]
+    rows: list[list] = Field(
+        default_factory=list,
+        description=f"结果行（超过 {INLINE_ROW_LIMIT} 行时只给前 {INLINE_ROW_LIMIT} 行）",
+    )
+    rows_inlined: int = 0
+    more_rows_available: bool = Field(
+        default=False,
+        description="true 表示结果被截断，请把统计下推到 SQL 里，不要基于部分数据下结论",
+    )
     applied_tables: list[str] = Field(default_factory=list)
     limit_applied: int | None = None
     truncated: bool = Field(
@@ -268,11 +285,14 @@ def run_sql(inp: RunSqlInput, ctx: ToolContext) -> RunSqlOutput:
     empty = len(rows) == 0 or all(
         cell is None for row in rows[:50] for cell in row
     )
+    inlined = rows[:INLINE_ROW_LIMIT]
     return RunSqlOutput(
         handle=handle,
         columns=list(columns),
         row_count=len(rows),
-        preview=[list(r) for r in rows[:5]],
+        rows=[list(r) for r in inlined],
+        rows_inlined=len(inlined),
+        more_rows_available=len(rows) > INLINE_ROW_LIMIT,
         applied_tables=guard.tables,
         limit_applied=guard.limit_applied,
         truncated=truncated,

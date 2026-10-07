@@ -121,6 +121,40 @@ def test_run_sql_applies_limit(registry, ctx):
     assert res.data["limit_applied"] == 10_000
 
 
+def test_small_result_is_returned_whole(registry, ctx):
+    """小结果集必须全量回传，否则模型只能看到前几行。
+
+    真实缺陷：以前固定只回传 5 行预览，结果
+      * "销量前 10 的商品"只看到 5 个，模型把其余概括成"其余5个商品"
+      * 某品类的订单数没落在前 5 行里，模型直接编了一个数
+    给了句柄却没有读取完整结果的途径，是设计问题不是模型问题。
+    """
+    res = call(
+        registry, ctx, "run_sql",
+        sql="SELECT city, COUNT(*) AS n FROM users GROUP BY city ORDER BY n DESC",
+    )
+    assert res.ok, res.error
+    assert res.data["row_count"] == res.data["rows_inlined"]
+    assert res.data["more_rows_available"] is False
+    assert len(res.data["rows"]) == res.data["row_count"]
+
+
+def test_large_result_is_truncated_with_a_flag(registry, ctx):
+    """大结果集截断时必须显式告诉模型，否则它会拿部分数据下结论。"""
+    res = call(registry, ctx, "run_sql", sql="SELECT order_id FROM orders")
+    assert res.ok, res.error
+    assert res.data["row_count"] > res.data["rows_inlined"]
+    assert res.data["more_rows_available"] is True
+    assert len(res.data["rows"]) == 50
+
+
+def test_result_row_limit_is_enough_for_ranking_tasks():
+    """前 N 名的任务里 N 最大是 10，50 行的内联上限足够覆盖。"""
+    from data_agent.tools.query_tools import INLINE_ROW_LIMIT
+
+    assert INLINE_ROW_LIMIT >= 30
+
+
 @pytest.mark.parametrize(
     "sql",
     [

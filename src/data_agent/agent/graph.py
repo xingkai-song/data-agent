@@ -530,17 +530,17 @@ def _summarize(result: Any) -> dict[str, Any]:
         "path",
         "replayed",
         "delivered",
+        "rows_inlined",
+        "more_rows_available",
     ):
         if key in data:
             summary[key] = data[key]
-    if "columns" in data:
-        summary["columns"] = data["columns"]
     return summary
 
 
 def _tool_message(result: Any) -> str:
     if result.ok:
-        return json.dumps(result.data, ensure_ascii=False, default=str)[:4000]
+        return json.dumps(result.data, ensure_ascii=False, default=str)[:8000]
     parts = [f"错误类型：{result.error_kind.value}", f"错误信息：{result.error}"]
     if result.hint:
         parts.append(f"修正建议：{result.hint}")

@@ -48,6 +48,18 @@
     - 按 pay_time 归期。若要统计"下单量"应按 create_time 且不过滤状态
   owner: 数据团队
 
+- name: order_count
+  display_name: 下单量
+  description: 统计期内创建的订单数量（含未支付）
+  definition: COUNT(DISTINCT orders.order_id)
+  base_table: orders
+  time_column: create_time
+  aliases: [下单量, 订单数, 下单数, 多少单, 订单量]
+  caveats:
+    - 按 create_time 归期，与成交类指标的归期字段不同。问"下了多少单"要用这个，不是 paid_order_count
+    - 不按状态过滤，pending 和 cancelled 的订单也算
+  owner: 数据团队
+
 - name: aov
   display_name: 客单价
   description: 成交总额 ÷ 已支付订单数
