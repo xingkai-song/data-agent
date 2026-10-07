@@ -143,6 +143,29 @@ def test_clarification_branch_skips_tool_execution(ctx):
     assert r.stop_reason == "需要澄清口径"
 
 
+def test_clarification_is_surfaced_as_the_answer(ctx):
+    """回归测试：澄清问题必须真的交回给用户。
+
+    这里曾经写成 body=None，导致"Agent 想澄清但用户什么都看不到"，
+    功能上等同于没有回答——7 条对抗样本就是这么丢掉输出的。
+    """
+    agent = agent_with(
+        [plan_response(True, "你是指按支付时间还是下单时间统计成交额？")],
+        ctx,
+    )
+    r = agent.run("上个月的销售额是多少？")
+    assert r.answer, "澄清分支没有产出任何可见内容"
+    assert "支付时间" in r.answer
+
+
+def test_clarification_without_question_still_answers(ctx):
+    """模型只置了 needs_clarification 但没给问题时，也要有兜底文案。"""
+    agent = agent_with([plan_response(True, None)], ctx)
+    r = agent.run("上个月的销售额是多少？")
+    assert r.status == "clarified"
+    assert r.answer and len(r.answer) > 5
+
+
 def test_understand_failure_degrades_gracefully(ctx):
     """意图识别那一步失败，不应该让整个任务挂掉，降级为直接执行。"""
 

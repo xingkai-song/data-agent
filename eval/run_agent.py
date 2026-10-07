@@ -105,6 +105,7 @@ def main() -> None:
                 "sql": sql,
                 "sqls": sqls,
                 "agent_status": r.status,
+                "clarification": r.clarification,
                 "stop_reason": r.stop_reason,
                 "steps": r.steps,
                 "tool_calls": len(r.tool_calls),
@@ -126,7 +127,11 @@ def main() -> None:
     )
     print(f"总耗时 {total_s:.1f}s，平均 {total_s / max(len(records), 1):.1f}s/条")
     print(f"预测文件：{out}")
-    print(f"\n下一步：./.venv/bin/python eval/runner.py --predictions {out.relative_to(PROJECT_ROOT)}")
+    try:
+        shown = out.relative_to(PROJECT_ROOT)
+    except ValueError:
+        shown = out
+    print(f"\n下一步：./.venv/bin/python eval/runner.py --predictions {shown}")
 
 
 if __name__ == "__main__":

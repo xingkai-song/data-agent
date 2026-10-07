@@ -29,8 +29,9 @@ def _slice_table(title: str, rows: list[dict[str, Any]], key: str) -> str:
 
 def render_report(run: dict[str, Any]) -> str:
     rows = run["results"]
-    total = len(rows)
-    passed = sum(1 for r in rows if r["matched"])
+    applicable = [r for r in rows if r.get("applicable", True)]
+    total = len(applicable)
+    passed = sum(1 for r in applicable if r["matched"])
     accuracy = passed / total if total else 0.0
 
     out: list[str] = []
@@ -39,6 +40,8 @@ def render_report(run: dict[str, Any]) -> str:
     out.append(f"- 预测来源：{run['source']}")
     out.append(f"- 数据快照：{run.get('warehouse', 'unknown')}")
     out.append(f"- 任务总数：{total}")
+    if len(rows) != total:
+        out.append(f"- 其中不适用结果集口径（对抗样本）：{len(rows) - total} 条")
     mode_label = (
         "任一查询命中（Agent 执行过的查询里有一条与标准一致）"
         if run.get("mode") == "best"

@@ -10,14 +10,23 @@ SYSTEM_PROMPT = """你是一个数据分析助手，负责把业务问题转成�
 
 ## 工作方式
 
-1. **先确认口径，再写 SQL。** 不确定指标定义时用 search_metrics；
-   不确定字段含义时用 describe_table。不要凭字段名猜测语义。
+1. **下面「相关口径与结构」里已经给了本次问题要用到的表结构、字段说明和指标口径。
+   优先直接使用它写 SQL，不要重复查询已知信息。**
+   只有当上下文里确实缺少你需要的内容时，才调用 `search_metrics` 或 `describe_table`——
+   每一次这类调用都会消耗步数预算。
 2. **用 run_sql 取数。** 取回的结果会给你一个句柄和少量预览行，
    不要试图在回复里复述全部数据。
 3. **复杂计算交给工具。** 分组统计用 analyze_dataframe，
    SQL 不好表达的（相关性、回归、自定义指标）用 run_python_sandbox。
 4. **结论必须基于实际查询结果。** 没有查到的数字不要写进结论，
    也不要凭常识推测。
+
+## 步数预算
+
+你最多只有 8 个推理步骤，每一步都很贵。**能一次写对的查询不要拆成多次试**。
+如果一条 SQL 同时要查多张表，请在一次查询里用 JOIN 完成，不要分几次查再手工拼。
+做完主查询、确认结果合理后，就直接给结论，不要为了「更稳妥」再跑对照查询——
+除非口径确实存在歧义且需要在结论里说明。
 
 ## 硬性要求
 
@@ -62,11 +71,18 @@ UNDERSTAND_PROMPT = """先分析这个业务问题，不要急着查数据。
 def build_first_user_message(question: str, context: str, plan: list[str]) -> str:
     parts = [f"## 用户问题\n\n{question}"]
     if context:
-        parts.append(f"## 相关口径与结构\n\n{context}")
+        parts.append(
+            "## 相关口径与结构\n\n"
+            "（这些是本次问题的相关定义，**已经可以直接用来写 SQL**，"
+            "不需要再调用工具去查一遍）\n\n" + context
+        )
     if plan:
         steps = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(plan))
         parts.append(f"## 你的执行计划\n\n{steps}")
-    parts.append("现在开始执行计划。先确认口径，再取数。")
+    parts.append(
+        "现在开始执行。直接用上面给的口径写 SQL 取数，"
+        "不要为了确认已经给出的信息而额外调用工具。"
+    )
     return "\n\n".join(parts)
 
 

@@ -102,9 +102,19 @@ def evaluate(
                 "category": t["category"],
                 "difficulty": t["difficulty"],
                 "matched": False,
+                # 对抗样本没有标准 SQL，结果集口径对它们不适用，
+                # 不能算进分母——否则会凭空拉低通过率
+                "applicable": bool(t.get("reference_sql")),
                 "reason": "",
                 "mismatches": [],
             }
+
+            if not record["applicable"]:
+                record["reason"] = "对抗样本，无标准 SQL，由 LLM 评委评估"
+                record["latency_ms"] = 0.0
+                record["numeric_match"] = False
+                results.append(record)
+                continue
 
             try:
                 golden = run_sql(wh, t["reference_sql"])
@@ -187,9 +197,15 @@ def evaluate(
 
 def print_summary(run: dict[str, Any]) -> None:
     rows = run["results"]
-    total = len(rows)
-    passed = sum(1 for r in rows if r["matched"])
-    print(f"\n结果集一致率（允许额外辅助列）：{passed}/{total} = {passed / total * 100:.1f}%")
+    applicable = [r for r in rows if r.get("applicable", True)]
+    total = len(applicable)
+    passed = sum(1 for r in applicable if r["matched"])
+    skipped = len(rows) - total
+    print(
+        f"\n结果集一致率（允许额外辅助列）：{passed}/{total} = "
+        f"{passed / max(total, 1) * 100:.1f}%"
+        + (f"（另有 {skipped} 条对抗样本不适用此口径）" if skipped else "")
+    )
     if "strict" in run:
         s = run["strict"]
         print(
@@ -253,14 +269,18 @@ def main() -> None:
             tasks, predictions, source=source, allow_extra_columns=False, mode="best"
         )
         run["strict"] = {
-            "passed": sum(1 for r in strict["results"] if r["matched"]),
-            "total": len(strict["results"]),
+            "passed": sum(
+                1 for r in strict["results"] if r["matched"] and r.get("applicable", True)
+            ),
+            "total": sum(1 for r in strict["results"] if r.get("applicable", True)),
             "mode": "best-exact-shape",
             "results": strict["results"],
         }
         run["numeric"] = {
-            "passed": sum(1 for r in run["results"] if r.get("numeric_match")),
-            "total": len(run["results"]),
+            "passed": sum(
+                1 for r in run["results"] if r.get("numeric_match") and r.get("applicable", True)
+            ),
+            "total": sum(1 for r in run["results"] if r.get("applicable", True)),
         }
     except Exception:
         traceback.print_exc()

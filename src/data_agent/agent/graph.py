@@ -106,8 +106,10 @@ class DataAgent:
         g.set_entry_point("understand")
         g.add_conditional_edges(
             "understand",
-            lambda s: "end" if s.get("needs_clarification") else "act",
-            {"end": END, "act": "act"},
+            # 需要澄清时也要走 synthesize——否则澄清问题不会被组装成最终输出，
+            # 用户什么都看不到（这个坑有回归测试守着）
+            lambda s: "synthesize" if s.get("needs_clarification") else "act",
+            {"synthesize": "synthesize", "act": "act"},
         )
         g.add_edge("act", "observe")
         g.add_conditional_edges(
@@ -380,7 +382,12 @@ class DataAgent:
             if status == "answered" and answer:
                 body: str | None = answer
             elif status == "clarified":
-                body = None
+                # 澄清分支必须把问题交回去。之前这里写成了 None，
+                # 结果是"Agent 想澄清但用户什么都看不到"——
+                # 功能上等同于没回答。
+                body = state.get("clarification") or (
+                    "这个问题存在多种口径，需要先确认你的口径后我才能给出准确结果。"
+                )
             else:
                 reason = state.get("stop_reason") or "未能完成分析"
                 body = (
