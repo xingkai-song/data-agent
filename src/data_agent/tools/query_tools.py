@@ -159,16 +159,25 @@ class SearchMetricsOutput(BaseModel):
     output_model=SearchMetricsOutput,
 )
 def search_metrics(inp: SearchMetricsInput, ctx: ToolContext) -> SearchMetricsOutput:
+    from data_agent.semantic.compiler import CompilerError, MetricCompiler
     from data_agent.semantic.context_builder import select
 
     sel = select(ctx.semantic, inp.query)
+    compiler = MetricCompiler(ctx.semantic)
+
+    def compiled_sql(metric) -> str:
+        try:
+            return compiler.compile(metric.name).sql
+        except CompilerError:
+            return metric.definition or metric.expression or ""
+
     return SearchMetricsOutput(
         metrics=[
             MetricBrief(
                 name=m.name,
                 display_name=m.display_name,
                 description=m.description,
-                definition=m.definition,
+                definition=compiled_sql(m),
                 time_column=f"{m.time_table_name()}.{m.time_column}",
                 filters=m.filters,
                 caveats=m.caveats,

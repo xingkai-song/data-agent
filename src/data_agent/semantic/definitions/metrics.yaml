@@ -1,6 +1,12 @@
 # 语义层 · 指标定义
 #
-# 每个指标给出：业务口径、可执行的 SQL 片段、以及容易搞错的地方。
+# 指标分两类：
+#   - 基础指标：definition 给出基础聚合片段，落在某一张表上
+#   - 派生指标：expression 用其他指标名组合，SQL 由编译器生成
+#
+# 派生指标不写 SQL、不写 JOIN。归期过滤、join 路径、粒度对齐都由
+# semantic/compiler.py 从表关系推导——同一个口径只写一次。
+#
 # alias 用于按用户口语检索指标（用户不会说 "net_gmv"，他会说"净销售额"）。
 
 - name: gmv
@@ -21,10 +27,10 @@
 - name: net_gmv
   display_name: 净成交额
   description: 成交总额扣除退款金额
-  definition: SUM(orders.amount) - COALESCE(SUM(refunds.refund_amount), 0)
+  # 派生指标：业务关系写清楚即可。退款表通过 orders 关联，
+  # 并按"所退订单的支付时间"归期（由 base_table/time_column 决定）。
+  expression: "{gmv} - COALESCE({refund_amount}, 0)"
   base_table: orders
-  joins:
-    - LEFT JOIN refunds ON refunds.order_id = orders.order_id
   time_column: pay_time
   filters:
     - orders.status IN ('paid', 'refunded')
@@ -63,7 +69,7 @@
 - name: aov
   display_name: 客单价
   description: 成交总额 ÷ 已支付订单数
-  definition: SUM(orders.amount) / NULLIF(COUNT(DISTINCT orders.order_id), 0)
+  expression: "{gmv} / NULLIF({paid_order_count}, 0)"
   base_table: orders
   time_column: pay_time
   filters:
@@ -79,8 +85,6 @@
   definition: SUM(order_items.unit_price * order_items.quantity - order_items.discount)
   base_table: order_items
   time_table: orders
-  joins:
-    - JOIN orders ON orders.order_id = order_items.order_id
   time_column: pay_time
   filters:
     - orders.status IN ('paid', 'refunded')
@@ -106,10 +110,8 @@
 - name: refund_rate
   display_name: 退款率
   description: 退款金额 ÷ 成交总额
-  definition: SUM(refunds.refund_amount) / NULLIF(SUM(orders.amount), 0)
+  expression: "{refund_amount} / NULLIF({gmv}, 0)"
   base_table: orders
-  joins:
-    - LEFT JOIN refunds ON refunds.order_id = orders.order_id
   time_column: pay_time
   filters:
     - orders.status IN ('paid', 'refunded')
@@ -149,4 +151,43 @@
   aliases: [活跃用户, DAU, 日活, 月活]
   caveats:
     - 这里定义的是"有埋点行为"的用户，不等于有下单的用户
+  owner: 数据团队
+
+- name: refund_count
+  display_name: 退款笔数
+  description: 统计期内发生的退款笔数
+  definition: COUNT(*)
+  base_table: refunds
+  time_column: refund_time
+  aliases: [退款笔数, 退款单数, 退了多少笔, 退款数量]
+  caveats:
+    - 按 refund_time 归期。与"退款金额"是两个不同的指标，不要混用
+  owner: 数据团队
+
+- name: vip_gmv
+  display_name: VIP 成交额
+  description: 统计期内付费会员贡献的成交金额
+  # 定义里引用了 users 的列，编译器会自动把 users join 进来
+  definition: SUM(CASE WHEN users.is_vip THEN orders.amount ELSE 0 END)
+  base_table: orders
+  time_column: pay_time
+  filters:
+    - orders.status IN ('paid', 'refunded')
+    - orders.pay_time IS NOT NULL
+  aliases: [VIP成交额, 会员成交额, 付费会员成交额, VIP销售额, 会员贡献]
+  caveats:
+    - 需要关联 users 判断 is_vip，这个 join 由编译器从定义里推导
+  owner: 数据团队
+
+- name: vip_gmv_share
+  display_name: VIP 成交额占比
+  description: VIP 成交额 ÷ 成交总额
+  expression: "{vip_gmv} / NULLIF({gmv}, 0)"
+  base_table: orders
+  time_column: pay_time
+  filters:
+    - orders.status IN ('paid', 'refunded')
+  aliases: [VIP占比, 会员成交占比, VIP贡献占比, 会员成交额占比]
+  caveats:
+    - 分子分母都按订单支付时间归期，口径一致
   owner: 数据团队

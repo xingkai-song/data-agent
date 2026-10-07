@@ -29,7 +29,7 @@ jobs:
         run: python -m pytest tests/ -q
 
       - name: 评测门禁（离线层）
-        # 评测集合法性 + 自检 100% + 负例 0%
+        # 评测集合法性 + 自检 100% + 负例 0% + 口径交叉校验（编译 SQL vs 参考 SQL）
         run: python eval/gate.py
 
   online:

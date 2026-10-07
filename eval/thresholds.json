@@ -6,7 +6,8 @@
     "wrong_answers_pass_rate_max": 0.0,
     "min_wrong_answer_cases": 16,
     "min_tasks_total": 60,
-    "min_adversarial_tasks": 20
+    "min_adversarial_tasks": 20,
+    "min_semantic_checks": 10
   },
   "online": {
     "_comment": "需要模型密钥。阈值基于 2026-10-07 基线（答案正确率 68.3%）向下留余量",

@@ -1,6 +1,6 @@
 """按意图检索语义层，组装成精简的上下文。
 
-为什么不做全量注入：把 6 张表 + 10 个指标 + 8 条规则全塞进 prompt，
+为什么不做全量注入：把 6 张表 + 11 个指标 + 8 条规则全塞进 prompt，
 既浪费 token 又会引入无关干扰——实测里这会让模型更容易选错字段。
 
 评分设计（踩过两次坑之后定下来的）：
@@ -20,10 +20,12 @@
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 
 from data_agent.semantic.models import Metric, Rule, SemanticLayer, Table
+from data_agent.semantic.compiler import CompilerError, MetricCompiler
 
 _ASCII_WORD = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]*")
 _CJK = re.compile(r"[\u4e00-\u9fff]+")
@@ -74,15 +76,9 @@ def _overlap_count(query_tokens: set[str], *texts: str) -> int:
     return len(query_tokens & merged)
 
 
-def _join_tables(metric: Metric, layer: SemanticLayer) -> list[str]:
-    """从指标的 join 语句里解析出它依赖哪些表。"""
-    known = {t.name for t in layer.tables}
-    found: list[str] = []
-    for join in metric.joins:
-        for ident in _ASCII_WORD.findall(join.lower()):
-            if ident in known and ident not in found:
-                found.append(ident)
-    return found
+def _required_tables(metric: Metric, layer: SemanticLayer) -> list[str]:
+    """指标依赖哪些表——由编译器沿关系图推导，指标定义里不再手写 join。"""
+    return MetricCompiler(layer).tables_for(metric)
 
 
 def _table_relevance(qt: set[str], table: Table) -> float:
@@ -194,7 +190,7 @@ def select(
     # 必选表：选中指标依赖的表（基础表 + join 用到的表），绝不能因为分数低被裁掉
     required: list[str] = []
     for m in selection.metrics:
-        for name in [m.base_table, *_join_tables(m, layer)]:
+        for name in _required_tables(m, layer):
             if name not in required:
                 required.append(name)
 
@@ -225,9 +221,31 @@ def select(
     return selection
 
 
-def render_context(selection: Selection, *, include_rules: bool = True) -> str:
-    """把检索结果渲染成可直接放进 prompt 的文本。"""
+def render_context(
+    selection: Selection,
+    *,
+    layer: SemanticLayer | None = None,
+    include_rules: bool = True,
+    emit_sql: bool | None = None,
+) -> str:
+    """把检索结果渲染成可直接放进 prompt 的文本。
+
+    传了 layer 就把编译出来的标准 SQL 一起给模型——模型拿到的是
+    "已经推导好 join 和归期过滤的模板"，而不是一串需要自己拼的片段。
+
+    `emit_sql=False` 时退回只给口径片段，用于消融对照：验证"注入编译 SQL"
+    这个变量本身带来多少差异。默认值可由环境变量 SEMANTIC_EMIT_SQL 控制。
+
+    默认**关闭**注入，依据是实测：60 条评测下，注入版答案正确率 73.3%、
+    不注入版 75.0%，平均 token 基本一致（8706 vs 8842）。这个变量没有
+    可测量的收益，所以不作为默认行为。编译器本身的价值在架构层面
+    （join 不手写、口径单一来源、编译产物可交叉校验），不在提示词体积。
+    模型需要完整 SQL 时仍然可以调 search_metrics 主动取，属于按需而非默认注入。
+    """
+    if emit_sql is None:
+        emit_sql = os.getenv("SEMANTIC_EMIT_SQL", "0") == "1"
     parts: list[str] = []
+    compiler = MetricCompiler(layer) if layer is not None else None
 
     if selection.tables:
         parts.append("## 相关表结构\n")
@@ -252,12 +270,28 @@ def render_context(selection: Selection, *, include_rules: bool = True) -> str:
         parts.append("## 指标口径\n")
         for m in selection.metrics:
             parts.append(f"### {m.name}（{m.display_name}）：{m.description}")
-            parts.append(f"- 计算：{m.definition}")
             parts.append(f"- 归期字段：{m.time_table_name()}.{m.time_column}")
-            if m.joins:
-                parts.append(f"- 需要的关联：{'; '.join(m.joins)}")
-            if m.filters:
-                parts.append(f"- 必须的过滤：{'; '.join(m.filters)}")
+            if m.is_derived:
+                parts.append(
+                    f"- 派生指标，由 {m.expression} 组合而成（已统一到上面的归期口径）"
+                )
+            sql = None
+            if compiler is not None and emit_sql:
+                try:
+                    sql = compiler.compile(m.name).sql
+                except CompilerError as exc:
+                    parts.append(f"- 口径编译失败：{exc}")
+            if sql:
+                parts.append(
+                    "- 标准 SQL（语义层编译生成；:start / :end 换成具体时间，"
+                    "需要分组时自行加 GROUP BY）："
+                )
+                for line in sql.splitlines():
+                    parts.append(f"    {line}")
+            else:
+                parts.append(f"- 计算：{m.definition or m.expression}")
+                if m.filters:
+                    parts.append(f"- 必须的过滤：{'; '.join(m.filters)}")
             for cv in m.caveats:
                 parts.append(f"- 【易错】{cv}")
             parts.append("")
@@ -274,4 +308,4 @@ def render_context(selection: Selection, *, include_rules: bool = True) -> str:
 def build_context(layer: SemanticLayer, question: str, **kwargs) -> tuple[Selection, str]:
     """便捷入口：检索 + 渲染。"""
     selection = select(layer, question, **kwargs)
-    return selection, render_context(selection)
+    return selection, render_context(selection, layer=layer)

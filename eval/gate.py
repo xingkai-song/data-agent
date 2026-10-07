@@ -170,6 +170,29 @@ def check_negative(tasks: list[dict], cfg: dict) -> float:
     return rate
 
 
+def check_semantics(cfg: dict) -> int:
+    """口径交叉校验：语义层编译出的 SQL 必须和评测集参考 SQL 算出同一个数。
+
+    这是本次改造补上的缺口。语义层里的指标定义和评测集里的 reference_sql
+    是两份独立写下的口径，两边不一致会出现最危险的情况——Agent 一直按错的
+    口径算，而评测显示"通过"（评委参考的也是错的那份）。
+
+    上一次跑就被抓出三处：T16 把"退款笔数"标成了 refund_amount、
+    T26 把"VIP 占比"标成了 gmv、T40 的复合口径没有标注。都是任务集自己的错。
+    """
+    from eval.semantic_check import cross_check
+
+    checked, failures = cross_check()
+    if checked < cfg.get("min_semantic_checks", 10):
+        raise GateFailure(
+            f"口径交叉校验只覆盖了 {checked} 条，少于门槛 "
+            f"{cfg.get('min_semantic_checks', 10)}——可能是任务集被改坏了"
+        )
+    if failures:
+        raise GateFailure("口径交叉校验失败：\n  - " + "\n  - ".join(failures))
+    return checked
+
+
 # ----------------------------------------------------------------------
 # 在线层
 # ----------------------------------------------------------------------
@@ -281,6 +304,9 @@ def main() -> None:
 
     negative = check_negative(tasks, cfg["offline"])
     print(f"  [通过] 负例（典型错误答案）通过率：{negative:.1%}（要求 0%）")
+
+    checked = check_semantics(cfg["offline"])
+    print(f"  [通过] 口径交叉校验（编译 SQL vs 参考 SQL）：{checked} 条")
 
     if args.online:
         sample = args.sample or cfg["online"]["sample_size"]

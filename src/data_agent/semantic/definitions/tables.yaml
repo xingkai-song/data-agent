@@ -2,6 +2,10 @@
 #
 # 这份文件的目的不是描述"表里有什么字段"（DDL 已经做了），而是告诉模型
 # "这些字段在业务上意味着什么、什么时候不能用、有什么坑"。
+#
+# relations 是表间关系声明（等价于外键）。指标定义里不再手写 JOIN，
+# 编译器沿这张关系图找路径生成。真实数仓里这层信息来自外键或 ER 元数据；
+# 本项目的表是用 DataFrame 直接写入的，没有外键约束，所以在这里显式补上。
 
 - name: orders
   description: 订单主表，一行一个订单
@@ -10,6 +14,9 @@
     - 统计成交类指标必须按 pay_time 归期，不要用 create_time
     - "已支付订单的 status 是 paid 或 refunded；refunded 表示已支付后又退款"
     - amount 是折扣后的应付金额，不要用明细表金额求和代替
+  relations:
+    - to: users
+      "on": orders.user_id = users.user_id
   columns:
     - name: order_id
       type: VARCHAR
@@ -88,6 +95,11 @@
   notes:
     - unit_price*quantity 是折扣前金额
     - 统计成交额请用 orders.amount，不要用这里的金额求和
+  relations:
+    - to: orders
+      "on": order_items.order_id = orders.order_id
+    - to: products
+      "on": order_items.product_id = products.product_id
   columns:
     - name: order_item_id
       type: VARCHAR
@@ -115,6 +127,9 @@
     - 只有 status='refunded' 的订单才会有退款记录
     - 退款可能是部分退款，refund_amount 不一定等于订单金额
     - 统计净成交额时需要扣减退款，统计 GMV 时不用
+  relations:
+    - to: orders
+      "on": refunds.order_id = orders.order_id
   columns:
     - name: refund_id
       type: VARCHAR
@@ -138,6 +153,9 @@
   grain: 一行一次页面访问事件
   notes:
     - 这是埋点日志，与订单没有直接外键关系，只能通过 user_id 关联
+  relations:
+    - to: users
+      "on": page_events.user_id = users.user_id
   columns:
     - name: event_id
       type: VARCHAR
