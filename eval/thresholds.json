@@ -1,0 +1,18 @@
+{
+  "_comment": "CI 门禁阈值。任何一项不达标就阻断合并。阈值来自真实基线，向下留余量以吸收模型波动。",
+  "offline": {
+    "_comment": "不需要模型密钥，纯确定性检查",
+    "sanity_pass_rate": 1.0,
+    "wrong_answers_pass_rate_max": 0.0,
+    "min_wrong_answer_cases": 16,
+    "min_tasks_total": 60,
+    "min_adversarial_tasks": 20
+  },
+  "online": {
+    "_comment": "需要模型密钥。阈值基于 2026-10-07 基线（答案正确率 68.3%）向下留余量",
+    "sample_size": 12,
+    "min_answer_accuracy": 0.5,
+    "min_sql_pass_rate": 0.6,
+    "max_circuit_break_ratio": 0.25
+  }
+}
