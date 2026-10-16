@@ -215,6 +215,12 @@ def test_tool_error_is_reflowed_to_model(ctx):
 
 
 def test_denied_error_also_reflowed(ctx):
+    """模型自己发出写操作时，SQL 守卫必须拦住并回灌。
+
+    注意这里刻意用一句**正常问题**：如果问题本身就是"把订单表清空"，
+    它会在理解阶段被 request_policy 直接拒绝（见 tests/test_request_policy.py），
+    走不到守卫这一步。而守卫要防的正是"问题看着正常、模型却自己写了个 DELETE"。
+    """
     llm = ScriptedLLM(
         [
             plan_response(),
@@ -223,7 +229,7 @@ def test_denied_error_also_reflowed(ctx):
         ]
     )
     agent = DataAgent(llm=llm, registry=default_registry(), tool_ctx=ctx)
-    r = agent.run("把订单表清空")
+    r = agent.run("9 月的成交总额是多少？")
     assert r.tool_calls[0]["error_kind"] == "denied"
     tool_msgs = [m for m in llm.calls[2]["messages"] if m.get("role") == "tool"]
     assert "只读" in tool_msgs[0]["content"]

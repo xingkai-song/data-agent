@@ -39,6 +39,7 @@ from data_agent.agent.prompts import (
     build_first_user_message,
 )
 from data_agent.agent.sanity import check_result
+from data_agent.safety.request_policy import check_request, refusal_message
 from data_agent.agent.state import AgentState, new_state
 from data_agent.llm.base import LLMClient
 from data_agent.observability.tracing import AgentTracer, setup_tracing
@@ -110,9 +111,13 @@ class DataAgent:
         g.set_entry_point("understand")
         g.add_conditional_edges(
             "understand",
-            # 需要澄清时也要走 synthesize——否则澄清问题不会被组装成最终输出，
-            # 用户什么都看不到（这个坑有回归测试守着）
-            lambda s: "synthesize" if s.get("needs_clarification") else "act",
+            # 需要澄清、以及被安全策略拒绝时，都要走 synthesize——否则那些文字
+            # 不会被组装成最终输出，用户什么都看不到（这个坑有回归测试守着）
+            lambda s: (
+                "synthesize"
+                if (s.get("needs_clarification") or s.get("status") == "refused")
+                else "act"
+            ),
             {"synthesize": "synthesize", "act": "act"},
         )
         g.add_edge("act", "observe")
@@ -131,6 +136,24 @@ class DataAgent:
     def _understand(self, state: AgentState) -> dict[str, Any]:
         question = state["question"]
         as_of = state.get("as_of") or time.strftime("%Y-%m-%d")
+
+        # 安全策略短路：写操作 / 越权访问 / 敏感信息导出，在理解阶段就拦下，
+        # 不进澄清、不进执行、不调模型。见 safety/request_policy.py
+        violation = check_request(question)
+        if violation:
+            with self.tracer.node("understand") as span:
+                span.set(**{"agent.policy_violation": violation})
+            usage = dict(state.get("usage", {}))
+            return {
+                "intent": {"policy_violation": violation},
+                "messages": [],
+                "selection": {},
+                "status": "refused",
+                "stop_reason": f"请求被安全策略拦截：{violation}",
+                "final_answer": refusal_message(violation),
+                "usage": usage,
+            }
+
         selection, context = build_context(self.tool_ctx.semantic, question)
 
         intent: dict[str, Any] = {}
@@ -393,7 +416,9 @@ class DataAgent:
             status = state.get("status", "running")
             answer = state.get("final_answer")
 
-            if status == "answered" and answer:
+            # refused 与 answered 走同一条：正文已经产生，直接用它。
+            # 这样"拒绝"也是一次正常作答，而不是"未能完成分析"。
+            if status in ("answered", "refused") and answer:
                 body: str | None = answer
             elif status == "clarified":
                 # 澄清分支必须把问题交回去。之前这里写成了 None，

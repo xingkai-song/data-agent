@@ -38,6 +38,8 @@ logger = logging.getLogger(__name__)
 # "stopped" 单独记一类，因为「熔断」和「失败」是两件事，排查时要能区分。
 _STATUS_MAP = {
     "answered": SUCCEEDED,
+    # 拒绝越权/写操作请求是**正常结束**——把问题交回用户，和澄清同理
+    "refused": SUCCEEDED,
     "clarified": SUCCEEDED,
     "stopped": STOPPED,
     "failed": FAILED,
