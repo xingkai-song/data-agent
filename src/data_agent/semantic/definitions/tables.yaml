@@ -65,6 +65,7 @@
       type: VARCHAR
       description: 用户所在城市
       notes: 可能为 NULL，分组统计时建议显式处理
+      null_label: 未知
     - name: channel
       type: VARCHAR
       description: "获客渠道：organic / ads / referral / social"

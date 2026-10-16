@@ -43,11 +43,15 @@ def all_successful_sqls(result) -> list[str]:
     常常还会跑验证性查询（比如为了展示不同口径的差异而多做一次对照）。
     只取最后一条会拿到对照查询，把答对的题判成错的。
     所以评测的候选集是**它执行过的全部查询**，命中任意一条即算通过。
+
+    取的是工具调用记录里的 `sql` 字段——`run_sql` 的 SQL 在参数里，
+    `run_metric`（编译优先路径）的 SQL 在结果里，这个字段把两者统一了。
+    早先这里只认 `run_sql`，会导致编译路径跑出来的题全部漏评。
     """
     return [
-        c["arguments"].get("sql")
+        c["sql"]
         for c in result.tool_calls
-        if c["name"] == "run_sql" and c.get("ok") and c["arguments"].get("sql")
+        if c.get("ok") and isinstance(c.get("sql"), str) and c["sql"]
     ]
 
 

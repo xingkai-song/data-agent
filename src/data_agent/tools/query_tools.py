@@ -233,6 +233,13 @@ class RunSqlOutput(BaseModel):
             "而是一行 NULL，所以这两种情况都要算 empty。"
         ),
     )
+    cross_check: list[str] = Field(
+        default_factory=list,
+        description=(
+            "多路径对算的结果：如果这条查询算的是语义层里已定义的派生指标，"
+            "会用编译器再算一遍做对照。非空表示两条路径对不上，下结论前必须核对。"
+        ),
+    )
 
 
 @tool(
@@ -247,9 +254,14 @@ class RunSqlOutput(BaseModel):
     timeout_s=30,
 )
 def run_sql(inp: RunSqlInput, ctx: ToolContext) -> RunSqlOutput:
+    return _execute_readonly(inp.sql, ctx, source="run_sql")
+
+
+def _execute_readonly(sql: str, ctx: ToolContext, *, source: str) -> RunSqlOutput:
+    """run_sql 与 run_metric 共用的执行路径：安全检查 → 执行 → 存句柄 → 组装输出。"""
     allowed = {t.name for t in ctx.semantic.tables}
     guard = check_readonly_sql(
-        inp.sql, allowed_tables=allowed, dialect="duckdb", max_rows=10_000
+        sql, allowed_tables=allowed, dialect="duckdb", max_rows=10_000
     )
     if not guard.allowed:
         # 表名拼错和安全越权在语法上长得一样，但处理方式完全不同：
@@ -285,7 +297,7 @@ def run_sql(inp: RunSqlInput, ctx: ToolContext) -> RunSqlOutput:
             ),
         ) from exc
 
-    handle = ctx.results.put(columns, rows, source="run_sql")
+    handle = ctx.results.put(columns, rows, source=source)
     # 只有"行数正好顶到上限"才是真的被截断。
     # 否则聚合查询（返回 1 行）也会被误判为截断，白白触发一次修正循环。
     truncated = guard.limit_applied is not None and len(rows) >= guard.limit_applied
@@ -295,6 +307,20 @@ def run_sql(inp: RunSqlInput, ctx: ToolContext) -> RunSqlOutput:
         cell is None for row in rows[:50] for cell in row
     )
     inlined = rows[:INLINE_ROW_LIMIT]
+    # 多路径对算：用编译器复核标量结果（只在能可靠判定时触发）。
+    # 编译路径（run_metric）的 SQL 本来就是编译器产出的，自己对自己没有意义，
+    # 只有模型手写的 run_sql 才需要这条独立路径来对照。
+    checks: list[str] = []
+    if source == "run_sql":
+        from data_agent.semantic.multipath import cross_check
+
+        checks = cross_check(
+            ctx.semantic,
+            guard.sql,
+            list(columns),
+            [list(r) for r in rows],
+            execute=lambda s: ctx.warehouse.query(s),
+        )
     return RunSqlOutput(
         handle=handle,
         columns=list(columns),
@@ -306,7 +332,160 @@ def run_sql(inp: RunSqlInput, ctx: ToolContext) -> RunSqlOutput:
         limit_applied=guard.limit_applied,
         truncated=truncated,
         empty=empty,
+        cross_check=checks,
     )
+
+
+# ---------- run_metric ----------
+
+
+class RunMetricInput(BaseModel):
+    metric: str = Field(
+        description="指标名或业务说法，例如 aov / 客单价 / 净成交额 / 退款率"
+    )
+    dimensions: list[str] = Field(
+        default_factory=list,
+        description=(
+            "分组维度，用字段名，例如 city / category / channel / device；"
+            "不传就是总量。"
+        ),
+    )
+    start: str | None = Field(
+        default=None, description="起始时间（含），如 2026-09-01"
+    )
+    end: str | None = Field(
+        default=None, description="结束时间（不含），如 2026-10-01"
+    )
+
+
+class RunMetricOutput(RunSqlOutput):
+    metric: str = Field(description="实际使用的指标名")
+    dimensions: list[str] = Field(default_factory=list, description="实际使用的维度")
+    compiled_sql: str = Field(description="语义层编译出的标准 SQL，便于审计")
+    notes: list[str] = Field(
+        default_factory=list,
+        description=(
+            "编译器给出的提醒，例如「从父表走向子表会让行数膨胀、聚合结果偏高」。"
+            "有内容时不要直接下结论。"
+        ),
+    )
+
+
+@tool(
+    name="run_metric",
+    description=(
+        "按语义层口径直接取一个已定义的指标，SQL 由编译器生成，不需要自己写。"
+        "问题就是要成交额 / 净成交额 / 客单价 / 退款率这类已定义指标时**优先用它**——"
+        "归期字段、过滤条件、join 都由语义层保证，不会写错口径。"
+        "只有问题超出已定义指标（临时组合、窗口函数、统计计算、探索性分析）时，"
+        "才改用 run_sql 自己写。"
+    ),
+    category="query",
+    input_model=RunMetricInput,
+    output_model=RunMetricOutput,
+    timeout_s=30,
+)
+def run_metric(inp: RunMetricInput, ctx: ToolContext) -> RunMetricOutput:
+    layer = ctx.semantic
+    metric = _resolve_metric(layer, inp.metric)
+    if metric is None:
+        raise ToolError(
+            ErrorKind.VALIDATION,
+            f"语义层里没有指标 `{inp.metric}`",
+            hint="可用指标：" + ", ".join(sorted(m.name for m in layer.metrics)),
+        )
+
+    dims: list[str] = []
+    for raw in inp.dimensions:
+        resolved, options = _resolve_dimension(layer, raw, metric)
+        if resolved is None:
+            raise ToolError(
+                ErrorKind.VALIDATION,
+                f"维度 `{raw}` 无法解析",
+                hint="可用维度：" + ("；".join(options) if options else "无"),
+            )
+        if resolved not in dims:
+            dims.append(resolved)
+
+    from data_agent.semantic.compiler import CompilerError, MetricCompiler
+
+    try:
+        compiled = MetricCompiler(layer).compile(
+            metric.name,
+            dimensions=dims,
+            start=inp.start,
+            end=inp.end,
+            friendly=True,  # 维度列用字段原名，NULL 按语义层声明归组
+        )
+    except CompilerError as exc:
+        raise ToolError(
+            ErrorKind.VALIDATION,
+            f"指标 `{metric.name}` 编译失败：{exc}",
+            hint="换一个指标，或改用 run_sql 自己写查询。",
+        ) from exc
+
+    base = _execute_readonly(compiled.sql, ctx, source="run_metric")
+    return RunMetricOutput(
+        **base.model_dump(),
+        metric=metric.name,
+        dimensions=dims,
+        compiled_sql=compiled.sql,
+        notes=list(compiled.notes),
+    )
+
+
+def _resolve_metric(layer, text: str):
+    """把用户/模型给的说法解析成语义层里的指标。"""
+    t = (text or "").strip()
+    if not t:
+        return None
+    low = t.lower()
+    for m in layer.metrics:  # 1) 指标名精确匹配
+        if m.name.lower() == low:
+            return m
+    for m in layer.metrics:  # 2) 展示名精确匹配
+        if m.display_name == t:
+            return m
+    best, best_len = None, 0  # 3) 别名/名字的最长包含匹配
+    for m in layer.metrics:
+        for alias in (*m.aliases, m.display_name, m.name):
+            a = alias.lower()
+            if len(a) < 2:
+                continue
+            if a in low or (len(low) >= 2 and low in a):
+                if len(alias) > best_len:
+                    best, best_len = m, len(alias)
+    return best
+
+
+def _resolve_dimension(layer, text: str, metric) -> tuple[str | None, list[str]]:
+    """把字段名解析成 `表.字段`。返回 (解析结果, 候选列表)。"""
+    name = (text or "").strip()
+    if not name:
+        return None, []
+    if "." in name:  # 已经是限定名
+        tbl, col = (p.strip() for p in name.split(".", 1))
+        t = layer.table(tbl)
+        if t is not None and col in t.column_names():
+            return f"{t.name}.{col}", []
+        return None, [f"`{name}` 不存在"]
+
+    cands = [(t.name, c.name) for t in layer.tables for c in t.columns if c.name == name]
+    if not cands:
+        cols = sorted({c.name for t in layer.tables for c in t.columns})
+        return None, [", ".join(cols)]
+    if len(cands) == 1:
+        tbl, col = cands[0]
+        return f"{tbl}.{col}", []
+
+    # 重名列（例如 channel 在 users 和 orders 都有）：优先该指标会用到的表
+    from data_agent.semantic.compiler import MetricCompiler
+
+    preferred = set(MetricCompiler(layer).tables_for(metric))
+    for tbl, col in cands:
+        if tbl in preferred:
+            return f"{tbl}.{col}", []
+    return None, [f"{t}.{c}" for t, c in cands]
 
 
 _UNKNOWN_TABLE = re.compile(r"表不在允许范围内：(\w+)")

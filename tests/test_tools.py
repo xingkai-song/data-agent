@@ -39,11 +39,11 @@ def call(registry, ctx, name, **args):
 # ---------- 注册表 ----------
 
 
-def test_all_nine_tools_registered(registry):
+def test_all_ten_tools_registered(registry):
     names = registry.names()
-    assert len(names) == 9
+    assert len(names) == 10
     assert {
-        "list_tables", "describe_table", "search_metrics", "run_sql",
+        "list_tables", "describe_table", "search_metrics", "run_sql", "run_metric",
         "analyze_dataframe", "run_python_sandbox", "make_chart",
         "export_report", "send_notification",
     } == set(names)
@@ -365,3 +365,86 @@ def test_side_effect_tool_refuses_without_idempotency_store(registry):
     res = call(registry, ctx_no_idem, "send_notification", channel="email", message="x")
     assert not res.ok
     assert res.error_kind is ErrorKind.INTERNAL
+
+
+# ---------- run_metric（编译优先路径） ----------
+
+
+def test_run_metric_prefers_semantic_layer_sql(registry, ctx):
+    """口径由编译器保证：模型只报指标名，不用自己写 SQL。"""
+    res = call(
+        registry, ctx, "run_metric",
+        metric="客单价", dimensions=["city"],
+        start="2026-09-01", end="2026-10-01",
+    )
+    assert res.ok, res.error
+    sql = res.data["compiled_sql"]
+    # 必须带上语义层声明的归期字段与过滤条件
+    assert "pay_time" in sql
+    assert "status IN ('paid', 'refunded')" in sql
+    assert "GROUP BY" in sql
+    assert res.data["metric"] == "aov"
+    assert res.data["dimensions"] == ["users.city"]
+    assert res.data["row_count"] > 0
+
+
+def test_run_metric_total_has_no_group_by(registry, ctx):
+    res = call(registry, ctx, "run_metric", metric="净成交额",
+               start="2026-09-01", end="2026-10-01")
+    assert res.ok, res.error
+    assert "GROUP BY" not in res.data["compiled_sql"]
+    assert res.data["row_count"] == 1
+
+
+def test_run_metric_matches_handwritten_sql(registry, ctx):
+    """编译路径与手写 SQL 在同一个口径上必须给出同一个数。"""
+    compiled = call(registry, ctx, "run_metric", metric="gmv",
+                    start="2026-09-01", end="2026-10-01")
+    manual = call(registry, ctx, "run_sql", sql=(
+        "SELECT SUM(o.amount) AS gmv FROM orders o "
+        "WHERE o.status IN ('paid','refunded') AND o.pay_time IS NOT NULL "
+        "AND o.pay_time >= '2026-09-01' AND o.pay_time < '2026-10-01'"
+    ))
+    assert compiled.ok and manual.ok
+    a = compiled.data["rows"][0][0]
+    b = manual.data["rows"][0][0]
+    assert abs(a - b) < 0.01
+
+
+def test_run_metric_rejects_unknown_metric(registry, ctx):
+    res = call(registry, ctx, "run_metric", metric="毛利率")
+    assert not res.ok
+    assert res.error_kind is ErrorKind.VALIDATION
+    assert "可用指标" in (res.hint or "")
+
+
+def test_run_metric_rejects_unknown_dimension(registry, ctx):
+    res = call(registry, ctx, "run_metric", metric="gmv", dimensions=["收货省份"])
+    assert not res.ok
+    assert res.error_kind is ErrorKind.VALIDATION
+
+
+def test_run_metric_resolves_ambiguous_dimension_by_metric(registry, ctx):
+    """channel 在 users 和 orders 都有，应优先指标会用到的表。"""
+    res = call(registry, ctx, "run_metric", metric="new_users", dimensions=["channel"],
+               start="2026-09-01", end="2026-10-01")
+    assert res.ok, res.error
+    assert res.data["dimensions"] == ["users.channel"]
+
+
+def test_run_metric_output_uses_readable_columns(registry, ctx):
+    """维度列要用字段名，不能把编译器内部的 d0 暴露出去。"""
+    res = call(registry, ctx, "run_metric", metric="gmv", dimensions=["city"],
+               start="2026-09-01", end="2026-10-01")
+    assert res.ok, res.error
+    assert res.data["columns"] == ["city", "gmv"]
+    # NULL 城市按语义层声明的 null_label 归组，而不是留下 NULL
+    assert "COALESCE(users.city, '未知')" in res.data["compiled_sql"]
+
+
+def test_run_metric_surfaces_fanout_note(registry, ctx):
+    """fan-out 风险必须透出给模型，不能静默。"""
+    res = call(registry, ctx, "run_metric", metric="gmv", dimensions=["category"],
+               start="2026-09-01", end="2026-10-01")
+    assert res.ok, res.error
+    assert any("膨胀" in n for n in res.data["notes"])

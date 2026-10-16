@@ -213,6 +213,36 @@ class MetricCompiler:
             parts.append(f"{ref} < TIMESTAMP '{end}'")
         return " AND ".join(parts)
 
+    # ------------------------------------------------------------------
+    # 维度渲染
+    # ------------------------------------------------------------------
+    def _dim_expr(self, qualified: str) -> str:
+        """维度的分组表达式：字段声明了 `null_label` 就补 COALESCE。
+
+        规则 R005 要求显式说明 NULL 怎么归组。声明一次（tables.yaml），
+        编译器统一生效——否则编译出的 SQL 与参考 SQL 的分组集合对不上
+        （一个出现 NULL 组，一个是 '未知' 组）。
+        """
+        table, _, col = qualified.partition(".")
+        t = self.layer.table(table)
+        if t is not None:
+            column = next((c for c in t.columns if c.name == col), None)
+            if column is not None and column.null_label:
+                return f"COALESCE({qualified}, '{column.null_label}')"
+        return qualified
+
+    def _dim_projection(self, dims: list[str], *, friendly: bool) -> str:
+        """维度列的输出。
+
+        `friendly=True` 时用字段原名做别名（给用户看的），否则用 d0..dn
+        ——后者是编译器内部 CTE 之间对齐用的，不能动。
+        """
+        parts: list[str] = []
+        for i, d in enumerate(dims):
+            alias = d.rpartition(".")[2] if friendly else f"d{i}"
+            parts.append(f"{self._dim_expr(d)} AS {alias}")
+        return ", ".join(parts)
+
     @staticmethod
     def _uniq(items: Iterable[str]) -> list[str]:
         out: list[str] = []
@@ -236,13 +266,14 @@ class MetricCompiler:
         end: str | None,
         *,
         value_alias: str = "v",
+        friendly: bool = False,
     ) -> str:
         """编译成 SELECT，输出列固定为 d0..dn（若有维度）+ value_alias。"""
         metric = self.layer.metric(name)
         if metric is None:
             raise CompilerError(f"指标 {name} 不存在")
 
-        dim_cols = ", ".join(f"{d} AS d{i}" for i, d in enumerate(dims))
+        dim_cols = self._dim_projection(dims, friendly=friendly)
         group_by = f" GROUP BY {', '.join(str(i + 1) for i in range(len(dims)))}" if dims else ""
         dim_prefix = f"{dim_cols}, " if dims else ""
 
@@ -293,7 +324,8 @@ class MetricCompiler:
             select_dims = []
             for j in range(len(dims)):
                 refs = ", ".join(f"{c}.d{j}" for c in cte_names)
-                select_dims.append(f"COALESCE({refs}) AS d{j}")
+                alias = dims[j].rpartition(".")[2] if friendly else f"d{j}"
+                select_dims.append(f"COALESCE({refs}) AS {alias}")
             prefix = ", ".join(select_dims) + ", "
         else:
             prefix = ""
@@ -351,11 +383,16 @@ class MetricCompiler:
         dimensions: Iterable[str] = (),
         start: str | None = None,
         end: str | None = None,
+        friendly: bool = False,
     ) -> CompiledMetric:
         """编译一个指标。
 
         `start` / `end` 为 None 时输出带 :start / :end 占位符的模板，
         用于放进提示词；给定具体时间则输出可直接执行的 SQL。
+
+        `friendly=True` 时维度列用字段原名做别名（`city` 而不是 `d0`），
+        并给声明了 `null_label` 的字段补 COALESCE——这是给用户/模型直接
+        执行的形态。默认 False 保留 d0..dn，供内部 CTE 对齐使用。
         """
         metric = self.layer.metric(name)
         if metric is None:
@@ -379,7 +416,7 @@ class MetricCompiler:
             for d in dims:
                 needed |= self._tables_in(d)
             clauses, notes, tables = self._from_and_joins(anchor.table, needed)
-            dim_cols = ", ".join(f"{d} AS d{i}" for i, d in enumerate(dims))
+            dim_cols = self._dim_projection(dims, friendly=friendly)
             prefix = f"{dim_cols}, " if dims else ""
             group_by = (
                 f" GROUP BY {', '.join(str(i + 1) for i in range(len(dims)))}"
@@ -402,7 +439,9 @@ class MetricCompiler:
                 notes=notes,
             )
 
-        inner = self._select_for(name, anchor, dims, start, end, value_alias=name)
+        inner = self._select_for(
+            name, anchor, dims, start, end, value_alias=name, friendly=friendly
+        )
         tables: list[str] = []
         for m in [metric, *self.leaves(metric)]:
             tables = self._uniq([*tables, m.base_table, m.time_table_name()])

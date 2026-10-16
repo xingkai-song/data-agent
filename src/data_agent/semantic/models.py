@@ -41,6 +41,10 @@ class Column(BaseModel):
     description: str
     notes: str | None = None
     values: dict[str, str] | None = None
+    # 分组时 NULL 归到哪个标签。规则 R005 要求"按城市分组时说明 NULL 怎么处理"，
+    # 声明在这里，编译器统一补 COALESCE——否则编译 SQL 和参考 SQL 的
+    # 分组集合对不上（NULL 组 vs '未知' 组）。
+    null_label: str | None = None
 
 
 class Table(BaseModel):

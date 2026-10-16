@@ -18,7 +18,7 @@
   filters:
     - orders.status IN ('paid', 'refunded')
     - orders.pay_time IS NOT NULL
-  aliases: [GMV, 成交额, 销售额, 营业额, 交易额, 总成交]
+  aliases: [GMV, 成交额, 销售额, 营业额, 流水, 交易额, 总成交, 成交金额, 购买额, 消费额, 卖了多少金额, 卖了多少钱]
   caveats:
     - 含已退款订单的金额。要看扣除退款后的口径请用 net_gmv
     - 必须按 pay_time 归期，不要用 create_time
@@ -35,7 +35,7 @@
   filters:
     - orders.status IN ('paid', 'refunded')
     - orders.pay_time IS NOT NULL
-  aliases: [净成交额, 净销售额, 扣除退款, 净额, 净GMV]
+  aliases: [净成交额, 净销售额, 扣除退款, 净额, 净GMV, 扣掉退款后的金额, 实收金额]
   caveats:
     - 这里的退款是按订单支付时间归期扣减（即退款计入其所退订单的支付期间）
     - 另一种常见口径是按 refund_time 归期扣减，两者结果不同。使用前必须先确认口径
@@ -49,7 +49,7 @@
   time_column: pay_time
   filters:
     - orders.status IN ('paid', 'refunded')
-  aliases: [支付订单数, 成交单量, 订单量, 成交量]
+  aliases: [支付订单数, 成交单量, 订单量, 成交量, 付了款的订单数, 完成支付的订单数, 已付款订单数]
   caveats:
     - 按 pay_time 归期。若要统计"下单量"应按 create_time 且不过滤状态
   owner: 数据团队
@@ -102,7 +102,7 @@
   definition: SUM(refunds.refund_amount)
   base_table: refunds
   time_column: refund_time
-  aliases: [退款额, 退款金额, 退货金额]
+  aliases: [退款额, 退款金额, 退货金额, 退款总额, 退了多少钱]
   caveats:
     - 按 refund_time 归期，与 gmv 的归期字段不同，做同比环比时要注意
   owner: 数据团队
@@ -126,7 +126,7 @@
   definition: COUNT(DISTINCT CASE WHEN orders.pay_time IS NOT NULL THEN orders.order_id END) * 1.0 / NULLIF(COUNT(DISTINCT orders.order_id), 0)
   base_table: orders
   time_column: create_time
-  aliases: [支付转化率, 转化率, 成交转化]
+  aliases: [支付转化率, 转化率, 成交转化, 支付比例, 付款比例]
   caveats:
     - 这个指标按 create_time 归期，和成交类指标的归期字段不同
   owner: 数据团队
@@ -148,7 +148,7 @@
   definition: COUNT(DISTINCT page_events.user_id)
   base_table: page_events
   time_column: event_time
-  aliases: [活跃用户, DAU, 日活, 月活]
+  aliases: [活跃用户, 访问用户, 有访问行为的用户, DAU, 日活, 月活]
   caveats:
     - 这里定义的是"有埋点行为"的用户，不等于有下单的用户
   owner: 数据团队
@@ -159,7 +159,7 @@
   definition: COUNT(*)
   base_table: refunds
   time_column: refund_time
-  aliases: [退款笔数, 退款单数, 退了多少笔, 退款数量]
+  aliases: [退款笔数, 退款单数, 退了多少笔, 退了多少单, 退款数量]
   caveats:
     - 按 refund_time 归期。与"退款金额"是两个不同的指标，不要混用
   owner: 数据团队

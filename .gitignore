@@ -12,3 +12,4 @@ eval/datasets/failure_candidates.jsonl
 eval/predictions/
 eval/results/
 .pytest_cache/
+.DS_Store

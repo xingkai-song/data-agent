@@ -19,6 +19,28 @@ from data_agent.semantic.loader import SemanticLayerError, load_semantic_layer
 WINDOW = {"start": "2026-09-01", "end": "2026-10-01"}
 
 
+def test_default_dimension_alias_stays_internal():
+    """默认用 d0..dn——这是编译器内部 CTE 对齐用的，不能改。"""
+    c = MetricCompiler(load_semantic_layer())
+    sql = c.compile("net_gmv", dimensions=["users.city"], **WINDOW).sql
+    assert "AS d0" in sql
+    assert "net_gmv__d0.d0 = net_gmv__d1.d0" in sql
+
+
+def test_friendly_dimension_uses_column_name_and_null_label():
+    """给用户执行的形态：字段原名做别名，NULL 按语义层声明归组。"""
+    c = MetricCompiler(load_semantic_layer())
+    merged = c.compile("gmv", dimensions=["users.city"], friendly=True, **WINDOW).sql
+    assert "AS city" in merged and "AS d0" not in merged
+    assert "COALESCE(users.city, '未知')" in merged
+
+    derived = c.compile("net_gmv", dimensions=["users.city"], friendly=True, **WINDOW).sql
+    # 内部 CTE 仍按 d0 对齐，但最外层输出用字段名
+    assert "net_gmv__d0.d0 = net_gmv__d1.d0" in derived
+    outer = derived.rsplit("SELECT", 1)[-1]
+    assert "AS city" in outer
+
+
 @pytest.fixture(scope="module")
 def layer():
     return load_semantic_layer()

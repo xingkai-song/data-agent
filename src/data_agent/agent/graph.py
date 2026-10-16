@@ -32,11 +32,13 @@ from opentelemetry import trace as _otel_trace
 from data_agent.agent.policies import Budget, LoopGuard, RetryPolicy
 from data_agent.agent.prompts import (
     EMPTY_RESULT_HINT,
+    SANITY_HINT,
     SYSTEM_PROMPT,
     TRUNCATED_HINT,
     UNDERSTAND_PROMPT,
     build_first_user_message,
 )
+from data_agent.agent.sanity import check_result
 from data_agent.agent.state import AgentState, new_state
 from data_agent.llm.base import LLMClient
 from data_agent.observability.tracing import AgentTracer, setup_tracing
@@ -294,11 +296,20 @@ class DataAgent:
                             message=(result.error or "")[:200],
                         )
             payload = result.model_dump(mode="json")
+            # 结果体检：零成本的不变量检查，抓"跑通了但数明显不对"（见 sanity.py）
+            data = payload.get("data")
+            warnings = check_result(data)
+            # 多路径对算的结论也一并回灌（工具在 query_tools 里算好，见 semantic/multipath.py）
+            if isinstance(data, dict):
+                warnings += [w for w in (data.get("cross_check") or []) if w not in warnings]
             tool_calls.append(
                 {
                     "step": state.get("step", 0) + 1,
                     "name": tc.name,
                     "arguments": tc.arguments,
+                    # 实际执行的 SQL：run_sql 在参数里，run_metric 在结果里。
+                    # 评测和审计都靠这个字段，缺了就会漏掉编译路径的题。
+                    "sql": _executed_sql(tc.name, tc.arguments, payload.get("data")),
                     "signature": LoopGuard.signature(tc.name, tc.arguments),
                     "ok": result.ok,
                     "error_kind": result.error_kind.value if result.error_kind else None,
@@ -312,6 +323,7 @@ class DataAgent:
                     "ok": result.ok,
                     "digest": LoopGuard.digest(payload.get("data")),
                     "summary": _summarize(result),
+                    "warnings": warnings,
                 }
             )
             if not result.ok:
@@ -485,6 +497,9 @@ def _diagnose(state: AgentState) -> str | None:
         return EMPTY_RESULT_HINT
     if summary.get("truncated"):
         return TRUNCATED_HINT
+    warnings = latest.get("warnings") or []
+    if warnings:
+        return SANITY_HINT.format(items="\n".join(f"- {w}" for w in warnings))
     return None
 
 
@@ -536,6 +551,19 @@ def _summarize(result: Any) -> dict[str, Any]:
         if key in data:
             summary[key] = data[key]
     return summary
+
+
+def _executed_sql(name: str, args: Any, data: Any) -> str | None:
+    """这次工具调用实际执行的 SQL。
+
+    run_sql 的 SQL 在入参里；run_metric 的 SQL 是编译器产出的，在结果里
+    （`compiled_sql`）。评测、审计、轨迹回放都依赖这个字段，所以统一暴露。
+    """
+    if isinstance(data, dict) and isinstance(data.get("compiled_sql"), str):
+        return data["compiled_sql"]
+    if isinstance(args, dict) and isinstance(args.get("sql"), str):
+        return args["sql"]
+    return None
 
 
 def _tool_message(result: Any) -> str:

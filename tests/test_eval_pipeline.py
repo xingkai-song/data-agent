@@ -71,23 +71,43 @@ def test_agent_sql_flows_into_eval_report(tmp_path):
 
 
 def test_last_successful_sql_ignores_failed_calls():
-    """只取成功的 run_sql；失败的查询不能拿去评测。"""
+    """只取成功的查询；失败的查询不能拿去评测。
+
+    工具调用记录里的 `sql` 字段是统一入口：run_sql 从入参取，
+    run_metric（编译优先）从编译器产出取。
+    """
 
     class FakeResult:
         tool_calls = [
-            {"name": "search_metrics", "ok": True, "arguments": {"query": "成交额"}},
-            {"name": "run_sql", "ok": False, "arguments": {"sql": "SELECT bad"}},
-            {"name": "run_sql", "ok": True, "arguments": {"sql": "SELECT good"}},
-            {"name": "make_chart", "ok": True, "arguments": {"handle": "rs_1"}},
+            {"name": "search_metrics", "ok": True, "arguments": {"query": "成交额"}, "sql": None},
+            {"name": "run_sql", "ok": False, "arguments": {"sql": "SELECT bad"}, "sql": "SELECT bad"},
+            {"name": "run_sql", "ok": True, "arguments": {"sql": "SELECT good"}, "sql": "SELECT good"},
+            {"name": "make_chart", "ok": True, "arguments": {"handle": "rs_1"}, "sql": None},
         ]
 
     assert last_successful_sql(FakeResult()) == "SELECT good"
 
 
+def test_compiled_metric_sql_counts_as_candidate():
+    """run_metric 走的是编译路径，它的 SQL 也必须进评测候选集。"""
+
+    class FakeResult:
+        tool_calls = [
+            {
+                "name": "run_metric",
+                "ok": True,
+                "arguments": {"metric": "gmv", "start": "2026-09-01", "end": "2026-10-01"},
+                "sql": "SELECT SUM(orders.amount) AS gmv FROM orders WHERE ...",
+            }
+        ]
+
+    assert last_successful_sql(FakeResult()).startswith("SELECT SUM(orders.amount)")
+
+
 def test_last_successful_sql_returns_none_when_no_query():
     class FakeResult:
         tool_calls = [
-            {"name": "search_metrics", "ok": True, "arguments": {"query": "x"}},
+            {"name": "search_metrics", "ok": True, "arguments": {"query": "x"}, "sql": None},
         ]
 
     assert last_successful_sql(FakeResult()) is None

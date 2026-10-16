@@ -7,7 +7,12 @@
     "min_wrong_answer_cases": 16,
     "min_tasks_total": 60,
     "min_adversarial_tasks": 20,
-    "min_semantic_checks": 10
+    "min_semantic_checks": 10,
+    "_holdout_comment": "留出集（tasks_v2.jsonl）：进程生成 + 守恒校验，用于测泛化性。阈值同样向下留余量",
+    "min_holdout_tasks": 60,
+    "min_holdout_with_sql": 40,
+    "_retrieval_comment": "检索干净命中率下限（召回与精确都对的占比）。实测 62.5% / 65%，向下留余量",
+    "min_retrieval_clean_hit": 0.55
   },
   "online": {
     "_comment": "需要模型密钥。阈值基于 2026-10-07 基线（答案正确率 68.3%）向下留余量",

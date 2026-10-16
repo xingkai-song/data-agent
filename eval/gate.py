@@ -34,6 +34,8 @@ for p in (PROJECT_ROOT / "src", PROJECT_ROOT):
 from data_agent.infra.db import Warehouse  # noqa: E402
 from eval.runner import TASKS_PATH, evaluate, load_predictions, load_tasks  # noqa: E402
 
+HOLDOUT_PATH = PROJECT_ROOT / "eval" / "datasets" / "tasks_v2.jsonl"
+
 
 class GateFailure(RuntimeError):
     """门禁未通过。"""
@@ -198,6 +200,83 @@ def check_semantics(cfg: dict) -> int:
 # ----------------------------------------------------------------------
 
 
+def check_holdout(tasks: list[dict], cfg: dict) -> list[str]:
+    """留出集（tasks_v2.jsonl）的合法性。
+
+    这批题是进程生成的：参考 SQL 来自语义层编译器，或由模板生成后再用
+    守恒律校验。所以校验方式与主集略有不同——没有 reference_sql 的题
+    必须给出 expected_behavior。
+    """
+    warnings: list[str] = []
+    ids = [t["id"] for t in tasks]
+    if len(ids) != len(set(ids)):
+        raise GateFailure("留出集任务 ID 重复")
+    if len(tasks) < cfg["min_holdout_tasks"]:
+        raise GateFailure(
+            f"留出集 {len(tasks)} 条少于门槛 {cfg['min_holdout_tasks']}"
+        )
+
+    with_sql = [t for t in tasks if t.get("reference_sql")]
+    if len(with_sql) < cfg["min_holdout_with_sql"]:
+        raise GateFailure(
+            f"留出集带参考 SQL 的只有 {len(with_sql)} 条，"
+            f"少于门槛 {cfg['min_holdout_with_sql']}"
+        )
+
+    with Warehouse() as wh:
+        for t in tasks:
+            sql = t.get("reference_sql")
+            if not sql:
+                if not t.get("expected_behavior"):
+                    raise GateFailure(
+                        f"留出集 {t['id']} 既没有参考 SQL 也没有 expected_behavior"
+                    )
+                continue
+            try:
+                rows = wh.query(sql)
+            except Exception as exc:  # noqa: BLE001
+                raise GateFailure(
+                    f"留出集 {t['id']} 参考 SQL 执行失败："
+                    f"{str(exc).splitlines()[0][:120]}"
+                ) from exc
+            if not rows:
+                warnings.append(f"⚠ 留出集 {t['id']} 参考 SQL 返回空结果")
+    return warnings
+
+
+def check_retrieval(task_sets: dict[str, list[dict]], cfg: dict) -> dict[str, float]:
+    """检索干净命中率：召回和精确都对的比例。
+
+    这是语义层检索的回归护栏——改别名表或改打分之后，这个数不能掉下去。
+    掉下去说明"改了检索，结果把本来对的题弄错了"。
+    """
+    from data_agent.semantic import load_semantic_layer
+    from data_agent.semantic.context_builder import select
+
+    layer = load_semantic_layer()
+    out: dict[str, float] = {}
+    floor = cfg["min_retrieval_clean_hit"]
+    for name, tasks in task_sets.items():
+        scored = clean = 0
+        for t in tasks:
+            expected = set(t.get("metrics") or [])
+            if not expected:
+                continue
+            scored += 1
+            got = set(select(layer, t["question"]).metric_names())
+            if expected <= got and got <= expected:
+                clean += 1
+        if not scored:
+            continue
+        rate = clean / scored
+        out[name] = rate
+        if rate < floor:
+            raise GateFailure(
+                f"{name} 检索干净命中率 {rate:.1%} 低于门槛 {floor:.0%}"
+            )
+    return out
+
+
 def check_online(tasks: list[dict], cfg: dict, sample: int) -> dict:
     """抽样跑真实任务，检查质量没有回退。"""
     from data_agent.agent import DataAgent
@@ -307,6 +386,19 @@ def main() -> None:
 
     checked = check_semantics(cfg["offline"])
     print(f"  [通过] 口径交叉校验（编译 SQL vs 参考 SQL）：{checked} 条")
+
+    holdout = load_tasks(HOLDOUT_PATH)
+    for w in check_holdout(holdout, cfg["offline"]):
+        print(f"  {w}")
+    print(f"  [通过] 留出集合法性检查：{len(holdout)} 条")
+
+    rates = check_retrieval(
+        {"主集": tasks, "留出集": holdout}, cfg["offline"]
+    )
+    print(
+        "  [通过] 检索干净命中率回归："
+        + " | ".join(f"{k} {v:.1%}" for k, v in rates.items())
+    )
 
     if args.online:
         sample = args.sample or cfg["online"]["sample_size"]
