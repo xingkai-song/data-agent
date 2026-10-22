@@ -2,7 +2,6 @@ name: Import repository bundle
 on:
   push:
     paths:
-      - 'data-agent.bundle'
       - '.github/workflows/import-bundle.yml'
 permissions:
   contents: write
@@ -10,13 +9,15 @@ jobs:
   import:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Import full repository history
+      - name: Import repository source
         env:
           TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          git clone --bare data-agent.bundle /tmp/import.git
-          cd /tmp/import.git
-          git remote set-url origin "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          git push --force origin 'refs/heads/*:refs/heads/*'
+          git clone data-agent.bundle /tmp/import
+          cd /tmp/import
+          git rm -r .github/workflows
+          git -c user.name='xingkai-song' -c user.email='xingkai-song@users.noreply.github.com' commit -m 'Import repository source'
+          git remote remove origin
+          git remote add origin "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push --force origin HEAD:refs/heads/source
