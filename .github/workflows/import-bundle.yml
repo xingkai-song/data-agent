@@ -1,0 +1,21 @@
+name: Import repository bundle
+on:
+  push:
+    paths:
+      - 'data-agent.bundle'
+permissions:
+  contents: write
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Import full repository history
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git clone --bare data-agent.bundle /tmp/import.git
+          cd /tmp/import.git
+          git remote add origin "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push --force origin 'refs/heads/*:refs/heads/*'
