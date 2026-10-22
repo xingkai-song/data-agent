@@ -3,6 +3,7 @@ on:
   push:
     paths:
       - 'data-agent.bundle'
+      - '.github/workflows/import-bundle.yml'
 permissions:
   contents: write
 jobs:
@@ -17,5 +18,5 @@ jobs:
           set -euo pipefail
           git clone --bare data-agent.bundle /tmp/import.git
           cd /tmp/import.git
-          git remote add origin "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git remote set-url origin "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git push --force origin 'refs/heads/*:refs/heads/*'
